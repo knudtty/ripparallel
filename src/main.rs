@@ -59,13 +59,18 @@ fn main() {
 
     let (sender, receiver) = unbounded();
 
-    let (stdout_sender, stdout_receiver): (Sender<(usize, JobResult)>, Receiver<(usize, JobResult)>) = unbounded();
+    let (stdout_sender, stdout_receiver): (
+        Sender<(usize, JobResult)>,
+        Receiver<(usize, JobResult)>,
+    ) = unbounded();
 
     // Send lines to shit
     thread::spawn(move || {
         for (i, line) in input.lines().enumerate() {
             if line.is_ok() {
-                sender.send((i, unsafe { line.unwrap_unchecked() })).unwrap();
+                sender
+                    .send((i, unsafe { line.unwrap_unchecked() }))
+                    .unwrap();
             }
         }
     });
@@ -87,12 +92,36 @@ fn main() {
 
     drop(stdout_sender);
 
-    // TODO: Make some function that sorts these by receiving the Vec<u8> as well as an index (iter
-    // enumerate when sending
+    // TODO: Make into a function
+    let mut next_customer = 0;
+    let mut waiting_room: Vec<(usize, JobResult)> = Vec::with_capacity(100);
     let mut stdout = std::io::stdout();
     for (i, res) in stdout_receiver {
-        //stdout.write_all(res.as_slice()).unwrap();
-        println!("{}", i);
+        if i == next_customer {
+            let mut new_customer = res;
+            loop {
+                // increment next_customer and write to stdout
+                stdout.write_all(new_customer.as_slice()).unwrap();
+                next_customer += 1;
+                // check for next customer in waiting_room
+                if let Some(idx) = waiting_room
+                    .iter()
+                    .position(|(customer, _)| customer == &next_customer)
+                {
+                    // if found, copy entry to new_customer, copy last entry into indexed spot and pop last entry.
+                    let tmp = waiting_room.last().unwrap().clone();
+                    let entry = waiting_room.get_mut(idx).unwrap();
+                    new_customer = entry.1.clone();
+                    *entry = tmp;
+                    waiting_room.pop();
+                } else {
+                    // else break loop
+                    break;
+                }
+            }
+        } else {
+            waiting_room.push((i, res));
+        }
     }
 
     // Send lines to the channel from the main thread
