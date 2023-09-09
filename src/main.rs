@@ -4,7 +4,7 @@ use fpar::thread_pool;
 use std::io::{self, Write};
 use std::process::Command;
 use std::sync::Arc;
-use std::thread;
+use std::thread::{self, JoinHandle};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None, trailing_var_arg = true)]
@@ -67,38 +67,30 @@ fn main() {
 
     let jobs = args.jobs.unwrap_or(thread_pool::max_par());
     let command = Arc::new(args.job);
-    let mut senders = Senders::new(Vec::with_capacity(jobs));
-    let mut receivers = Vec::with_capacity(jobs);
-    (0..jobs).for_each(|_| {
-        // Create a channel for threads to send lines
-        let (sender, receiver) = unbounded();
-        senders.senders.push(sender);
-        receivers.push(receiver);
-    });
+
+    let (sender, receiver) = unbounded();
 
     let (stdout_sender, stdout_receiver): (Sender<Vec<u8>>, Receiver<Vec<u8>>) = unbounded();
+
     // print lines to stdout
-    for line in input.lines() {
-        senders.send_next(line.unwrap());
-    }
+    thread::spawn(move || {
+        for line in input.lines() {
+            sender.send(line.unwrap()).unwrap();
+        }
+    });
 
-    // Create a thread pool with 10 threads
-    let mut handles = vec![];
-    for receiver in receivers.iter() {
-        println!("here");
-        let this_receiver = receiver.clone();
-        let this_sender = stdout_sender.clone();
+    let handles: Vec<JoinHandle<()>> = (0..jobs).map(|_| {
+        let receiver = receiver.clone();
+        let stdout_sender = stdout_sender.clone();
         let this_command = Arc::clone(&command);
-        let handle = thread::spawn(move || {
-            for line in this_receiver {
+        return thread::spawn(move || {
+            for line in receiver {
                 let res = the_thing(line, &this_command);
-                this_sender.send(res).unwrap();
+                stdout_sender.send(res).unwrap();
             }
-        });
-        handles.push(handle);
-    }
+        })
+    }).collect();
 
-    drop(senders);
     drop(stdout_sender);
     let stdout = std::io::stdout();
     for res in stdout_receiver {
