@@ -13,52 +13,41 @@ struct Args {
     #[arg(short, long)]
     jobs: Option<usize>,
 
+    /// Maintain order that inputs came in
+    #[arg(short, long)]
+    order: Option<bool>,
+
     /// job to run
     job: Vec<String>,
 }
 
-fn the_thing(line: String, command: &Arc<Vec<String>>) -> Vec<u8> {
-    let proper_command: String = command.iter().fold(String::new(), |mut s, c| {
-        s.push_str(" ");
-        s.push_str(match c.as_str() {
-            "{}" => &line,
-            _ => c,
-        });
-        s
-    });
-    let res = Command::new("sh")
-        .arg("-c")
-        .arg(&proper_command)
-        .output()
-        .expect("deez nuts broken");
-    res.stdout
-}
-
-struct Senders<T> {
-    senders: Vec<Sender<T>>,
-    cur: usize,
-    size: usize,
-}
-
-impl<T> Senders<T> {
-    fn new(senders: Vec<Sender<T>>) -> Self {
-        let len = senders.len();
-        Senders {
-            senders,
-            cur: len,
-            size: len,
+type JobResult = Vec<u8>;
+fn the_thing(line: String, command: &Arc<Vec<String>>) -> JobResult {
+    // TODO: Construct command without sh -c
+    let mut cmditer = command.iter();
+    let mut cmd: Command;
+    let mut substituted = false;
+    match cmditer.next().expect("shid broken").as_ref() {
+        "{}" => {
+            substituted = true;
+            cmd = Command::new("sh");
+            cmd.arg("-c").arg(line.as_str());
         }
-    }
-
-    fn send_next(&mut self, data: T) {
-        if self.cur == self.size {
-            self.cur = 0;
+        first => cmd = Command::new(first),
+    };
+    cmditer.for_each(|arg| {
+        if arg.as_str() == "{}" {
+            substituted = true;
+            cmd.arg(line.as_str());
         } else {
-            self.cur += 1;
+            cmd.arg(arg);
         }
-        let sender = self.senders.get(self.cur).unwrap();
-        sender.send(data).unwrap();
-    }
+    });
+    if !substituted {
+        cmd.arg(line.as_str());
+    };
+    let res = cmd.output().expect("deez nuts broken");
+    res.stdout.into()
 }
 
 fn main() {
@@ -70,31 +59,40 @@ fn main() {
 
     let (sender, receiver) = unbounded();
 
-    let (stdout_sender, stdout_receiver): (Sender<Vec<u8>>, Receiver<Vec<u8>>) = unbounded();
+    let (stdout_sender, stdout_receiver): (Sender<(usize, JobResult)>, Receiver<(usize, JobResult)>) = unbounded();
 
-    // print lines to stdout
+    // Send lines to shit
     thread::spawn(move || {
-        for line in input.lines() {
-            sender.send(line.unwrap()).unwrap();
+        for (i, line) in input.lines().enumerate() {
+            if line.is_ok() {
+                sender.send((i, unsafe { line.unwrap_unchecked() })).unwrap();
+            }
         }
     });
 
-    let handles: Vec<JoinHandle<()>> = (0..jobs).map(|_| {
-        let receiver = receiver.clone();
-        let stdout_sender = stdout_sender.clone();
-        let this_command = Arc::clone(&command);
-        return thread::spawn(move || {
-            for line in receiver {
-                let res = the_thing(line, &this_command);
-                stdout_sender.send(res).unwrap();
-            }
+    let handles: Vec<JoinHandle<()>> = (0..jobs)
+        .map(|_| {
+            let receiver = receiver.clone();
+            let stdout_sender = stdout_sender.clone();
+            let this_command = Arc::clone(&command);
+            return thread::spawn(move || {
+                // single receiver shared between all threads
+                for (i, line) in receiver {
+                    let res = the_thing(line, &this_command);
+                    stdout_sender.send((i, res)).unwrap();
+                }
+            });
         })
-    }).collect();
+        .collect();
 
     drop(stdout_sender);
-    let stdout = std::io::stdout();
-    for res in stdout_receiver {
-        stdout.lock().write(res.as_slice()).unwrap();
+
+    // TODO: Make some function that sorts these by receiving the Vec<u8> as well as an index (iter
+    // enumerate when sending
+    let mut stdout = std::io::stdout();
+    for (i, res) in stdout_receiver {
+        //stdout.write_all(res.as_slice()).unwrap();
+        println!("{}", i);
     }
 
     // Send lines to the channel from the main thread
