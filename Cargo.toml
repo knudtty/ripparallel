@@ -1,0 +1,16 @@
+[package]
+name = "ripparallel"
+version = "0.1.0"
+edition = "2021"
+description = "ripparallel is a line-oriented job parallelization tool that enables parallelization across cpu cores with minimal overhead."
+license = "MIT"
+
+[[bin]]
+name = "rp"
+path = "src/main.rs"
+test = false
+bench = false
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
