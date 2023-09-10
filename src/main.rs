@@ -1,5 +1,5 @@
 use clap::Parser;
-use crossbeam_channel::unbounded;
+use crossbeam_channel::bounded;
 use fpar::thread_pool;
 use std::io::{self, Write};
 use std::process::Command;
@@ -60,13 +60,13 @@ fn main() {
 
     let (job_senders, job_receivers) =
         (0..jobs).fold((Vec::new(), Vec::new()), |(mut s, mut r), _| {
-            let (sender, receiver) = unbounded();
+            let (sender, receiver) = bounded(1);
             s.push(sender);
             r.push(receiver);
             (s, r)
         });
-    let (broker_sender, job_status_receiver) = unbounded();
-    let (stdout_sender, stdout_receiver) = unbounded();
+    let (broker_sender, job_status_receiver) = bounded(jobs);
+    let (stdout_sender, stdout_receiver) = bounded(jobs);
 
     let handles: Vec<JoinHandle<()>> = job_receivers
         .iter()
@@ -111,7 +111,7 @@ fn main() {
 
     // TODO: Make into a function
     let mut next_customer = 0;
-    let mut waiting_room: Vec<(usize, JobResult)> = Vec::with_capacity(100);
+    let mut waiting_room: Vec<(usize, JobResult)> = Vec::new();
     let mut stdout = std::io::stdout();
     for (i, res) in stdout_receiver {
         if i == next_customer {
