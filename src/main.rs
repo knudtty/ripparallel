@@ -1,5 +1,5 @@
 use clap::Parser;
-use crossbeam_channel::{unbounded, Receiver, Sender};
+use crossbeam_channel::unbounded;
 use fpar::thread_pool;
 use std::io::{self, Write};
 use std::process::Command;
@@ -22,6 +22,7 @@ struct Args {
 }
 
 type JobResult = Vec<u8>;
+
 fn the_thing(line: String, command: &Arc<Vec<String>>) -> JobResult {
     // TODO: Construct command without sh -c
     let mut cmditer = command.iter();
@@ -54,42 +55,58 @@ fn main() {
     let args = Args::parse();
     let input = io::stdin();
 
-    let jobs = args.jobs.unwrap_or(thread_pool::max_par());
+    let jobs = args.jobs.unwrap_or(thread_pool::max_par()-1);
     let command = Arc::new(args.job);
 
-    let (sender, receiver) = unbounded();
+    let (job_senders, job_receivers) =
+        (0..jobs).fold((Vec::new(), Vec::new()), |(mut s, mut r), _| {
+            let (sender, receiver) = unbounded();
+            s.push(sender);
+            r.push(receiver);
+            (s, r)
+        });
+    let (broker_sender, job_status_receiver) = unbounded();
+    let (stdout_sender, stdout_receiver) = unbounded();
 
-    let (stdout_sender, stdout_receiver): (
-        Sender<(usize, JobResult)>,
-        Receiver<(usize, JobResult)>,
-    ) = unbounded();
-
-    // Send lines to shit
-    thread::spawn(move || {
-        for (i, line) in input.lines().enumerate() {
-            if line.is_ok() {
-                sender
-                    .send((i, unsafe { line.unwrap_unchecked() }))
-                    .unwrap();
-            }
-        }
-    });
-
-    let handles: Vec<JoinHandle<()>> = (0..jobs)
-        .map(|_| {
-            let receiver = receiver.clone();
+    let handles: Vec<JoinHandle<()>> = job_receivers
+        .iter()
+        .cloned()
+        .enumerate()
+        .map(|(id, job_receiver)| {
             let stdout_sender = stdout_sender.clone();
+            let broker_sender = broker_sender.clone();
             let this_command = Arc::clone(&command);
             return thread::spawn(move || {
                 // single receiver shared between all threads
-                for (i, line) in receiver {
-                    let res = the_thing(line, &this_command);
+                for (i, job_input) in job_receiver {
+                    let res = the_thing(job_input, &this_command);
+                    // TODO: Test order. I think this would be better?
                     stdout_sender.send((i, res)).unwrap();
+                    let _ = broker_sender.send(id);
                 }
             });
         })
         .collect();
 
+    // Broker thread
+    thread::spawn(move || {
+        // It might be expensive to read from stdin. Investigate reading all to vec, then brokering
+        let mut lines_iter = input.lines().enumerate();
+        job_senders.iter().for_each(|sender| {
+            let (i, line_res) = lines_iter.next().unwrap();
+            sender.send((i, line_res.unwrap())).unwrap();
+        });
+        for (job_id, line_res) in lines_iter {
+            match job_status_receiver.recv() {
+                Ok(thread_id) => job_senders
+                    .get(thread_id)
+                    .unwrap()
+                    .send((job_id, line_res.unwrap()))
+                    .unwrap(),
+                _ => {}
+            }
+        }
+    });
     drop(stdout_sender);
 
     // TODO: Make into a function
