@@ -11,6 +11,10 @@ struct Args {
     #[arg(short, long)]
     jobs: Option<usize>,
 
+    /// Placeholder
+    #[arg(short = 'I')]
+    replace_string: Option<String>,
+
     /// Maintain order that inputs came in
     #[arg(short, long)]
     order: Option<bool>,

@@ -158,14 +158,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a26ae43d7bcc3b814de94796a5e736d4029efb0ee900c12e2d54c993ad1a1e07"
 
 [[package]]
-name = "fpar"
-version = "0.1.0"
-dependencies = [
- "clap",
- "rayon",
-]
-
-[[package]]
 name = "heck"
 version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -240,6 +232,14 @@ dependencies = [
  "crossbeam-deque",
  "crossbeam-utils",
  "num_cpus",
+]
+
+[[package]]
+name = "ripparallel"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "rayon",
 ]
 
 [[package]]
