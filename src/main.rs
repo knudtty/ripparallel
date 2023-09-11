@@ -1,6 +1,6 @@
 use clap::Parser;
-use ripparallel::thread_pool;
 use crossbeam_channel::{unbounded, Receiver, Sender};
+use ripparallel::thread_pool;
 use std::io::{self, Write};
 use std::process::Command;
 use std::sync::Arc;
@@ -46,16 +46,20 @@ struct Senders<T> {
 
 impl<T> Senders<T> {
     fn new(senders: Vec<Sender<T>>) -> Self {
-        let len = senders.len();
         Senders {
             senders,
-            cur: len,
-            size: len,
+            cur: 0,
+            size: 0,
         }
     }
 
+    fn push(&mut self, sender: Sender<T>) {
+        self.size += 1;
+        self.senders.push(sender);
+    }
+
     fn send_next(&mut self, data: T) {
-        if self.cur == self.size {
+        if self.cur == self.size - 1 {
             self.cur = 0;
         } else {
             self.cur += 1;
@@ -76,7 +80,7 @@ fn main() {
     (0..jobs).for_each(|_| {
         // Create a channel for threads to send lines
         let (sender, receiver) = unbounded();
-        senders.senders.push(sender);
+        senders.push(sender);
         receivers.push(receiver);
     });
 
@@ -92,10 +96,14 @@ fn main() {
         let this_receiver = receiver.clone();
         let this_sender = stdout_sender.clone();
         let this_command = Arc::clone(&command);
-        let handle = thread::spawn(move || {
-            for line in this_receiver {
-                let res = the_thing(line, &this_command);
-                this_sender.send(res).unwrap();
+        let handle = thread::spawn(move || loop {
+            let input_line = this_receiver.recv();
+            match input_line {
+                Ok(line) => {
+                    let res = the_thing(line, &this_command);
+                    this_sender.send(res).unwrap();
+                }
+                _ => break,
             }
         });
         handles.push(handle);
