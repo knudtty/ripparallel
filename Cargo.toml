@@ -17,4 +17,3 @@ bench = false
 clap = { version = "4.4.2", features = ["derive"] }
 crossbeam = "0.8.2"
 crossbeam-channel = "0.5.8"
-once_cell = "1.18.0"

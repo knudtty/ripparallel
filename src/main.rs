@@ -25,6 +25,11 @@ struct Args {
     job: Vec<String>,
 }
 
+enum Message {
+    Job((usize, String)),
+    Quit,
+}
+
 type JobResult = Vec<u8>;
 
 fn the_thing(line: String, command: &Arc<Vec<String>>) -> JobResult {
@@ -59,70 +64,75 @@ fn main() {
     let args = Args::parse();
     let input = io::stdin();
 
-    let jobs = args.jobs.unwrap_or(thread_pool::max_par()-1);
+    let jobs = args.jobs.unwrap_or(thread_pool::max_par() - 1);
     let command = Arc::new(args.job);
 
-    let (job_senders, job_receivers) =
-        (0..jobs).fold((Vec::new(), Vec::new()), |(mut s, mut r), _| {
-            let (sender, receiver) = bounded(1);
-            s.push(sender);
-            r.push(receiver);
-            (s, r)
-        });
-    let (broker_sender, job_status_receiver) = bounded(jobs);
+    let (job_sender, job_receiver) = bounded(jobs);
     let (stdout_sender, stdout_receiver) = bounded(jobs);
 
-    let handles: Vec<JoinHandle<()>> = job_receivers
-        .iter()
-        .cloned()
-        .enumerate()
-        .map(|(id, job_receiver)| {
+    // job_sender.len()
+    let handles: Vec<JoinHandle<()>> = (0..jobs)
+        .map(|_| {
             let stdout_sender = stdout_sender.clone();
-            let broker_sender = broker_sender.clone();
             let this_command = Arc::clone(&command);
+            let job_receiver = job_receiver.clone();
             return thread::spawn(move || {
                 // single receiver shared between all threads
-                for (i, job_input) in job_receiver {
-                    let res = the_thing(job_input, &this_command);
-                    // TODO: Test order. I think this would be better?
-                    stdout_sender.send((i, res)).unwrap();
-                    let _ = broker_sender.send(id);
+                for job in job_receiver {
+                    match job {
+                        Message::Job((i, job_input)) => {
+                            let res = the_thing(job_input, &this_command);
+                            stdout_sender.send((i, res)).unwrap();
+                        },
+                        Message::Quit => break
+                    }
                 }
             });
         })
         .collect();
 
-    // Broker thread
-    thread::spawn(move || {
-        // It might be expensive to read from stdin. Investigate reading all to vec, then brokering
-        let mut lines_iter = input.lines().enumerate();
-        job_senders.iter().for_each(|sender| {
-            let (i, line_res) = lines_iter.next().unwrap();
-            sender.send((i, line_res.unwrap())).unwrap();
-        });
-        for (job_id, line_res) in lines_iter {
-            match job_status_receiver.recv() {
-                Ok(thread_id) => job_senders
-                    .get(thread_id)
-                    .unwrap()
-                    .send((job_id, line_res.unwrap()))
-                    .unwrap(),
-                _ => {}
-            }
-        }
-    });
+    // all steps necessary in order to preparing to start
     drop(stdout_sender);
+    let mut lines_iter = input.lines().enumerate().peekable();
+    // fill jobs initially
+    for _ in 0..jobs {
+        let (i, line_res) = lines_iter.next().unwrap();
+        job_sender
+            .send(Message::Job((i, line_res.unwrap())))
+            .unwrap();
+    }
 
-    // TODO: Make into a function
+    // TODO: Make this ordering thing into a function
     let mut next_customer = 0;
     let mut waiting_room: Vec<(usize, JobResult)> = Vec::new();
     let mut stdout = std::io::stdout();
     for (i, res) in stdout_receiver {
+        // before calling waiting room function
+        if lines_iter.peek().is_some() {
+            let n_messages_under = jobs - job_sender.len();
+            //println!("n_messages_under: {}", n_messages_under);
+            for _ in 0..n_messages_under {
+                match lines_iter.next() {
+                    Some((id, Ok(job))) => {
+                        job_sender
+                            .send(Message::Job((id, job)))
+                            .expect("Broker: Unable to send job");
+                    }
+                    _ => {}
+                }
+                break;
+            }
+        } else {
+            job_sender.send(Message::Quit).expect("Unable to send quit message");
+        }
+        // before calling waiting room function
         if i == next_customer {
             let mut new_customer = res;
             loop {
+                // portable function part
                 // increment next_customer and write to stdout
                 stdout.write_all(new_customer.as_slice()).unwrap();
+                // portable function part
                 next_customer += 1;
                 // check for next customer in waiting_room
                 if let Some(idx) = waiting_room
