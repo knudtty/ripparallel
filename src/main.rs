@@ -1,6 +1,6 @@
 use clap::Parser;
 use crossbeam_channel::unbounded;
-use fpar::thread_pool;
+use ripparallel::thread_pool;
 use std::io::{self, Write};
 use std::process::Command;
 use std::sync::Arc;
@@ -12,6 +12,10 @@ struct Args {
     /// Number of jobs
     #[arg(short, long)]
     jobs: Option<usize>,
+
+    /// Placeholder
+    #[arg(short = 'I')]
+    replace_string: Option<String>,
 
     /// Maintain order that inputs came in
     #[arg(short, long)]
