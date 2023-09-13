@@ -1,9 +1,8 @@
 use clap::Parser;
 use crossbeam_channel::bounded;
+use ripparallel::shell::Shell;
 use ripparallel::thread_pool;
-use std::io;
-use std::process::Stdio;
-use std::process::{ChildStdout, Command};
+use std::io::{self, Write};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 
@@ -31,40 +30,30 @@ enum Message {
     Quit,
 }
 
-type JobResult = ChildStdout;
+type JobResult = Vec<u8>;
 
-fn the_thing(line: String, command: &Arc<Vec<String>>) -> Result<JobResult, ()> {
-    // TODO: Construct command without sh -c
-    let mut cmditer = command.iter();
-    let mut cmd: Command;
+fn parse_command(command_args: Arc<Vec<String>>, job_input: String) -> String {
+    let cmd_args_len = command_args.len();
+    let cmditer = command_args.iter().enumerate();
+    let mut command = String::new();
     let mut substituted = false;
-    match cmditer.next().expect("shid broken").as_ref() {
-        "{}" => {
-            substituted = true;
-            cmd = Command::new("sh");
-            cmd.arg("-c").arg(line.as_str());
-        }
-        first => cmd = Command::new(first),
-    };
-    cmditer.for_each(|arg| {
+    cmditer.for_each(|(i, arg)| {
         if arg.as_str() == "{}" {
             substituted = true;
-            cmd.arg(line.as_str());
+            command.push_str(job_input.as_str());
+            command.push(' ');
         } else {
-            cmd.arg(arg);
+            command.push_str(arg.as_str());
+            if i - 1 != cmd_args_len  {
+                command.push(' ');
+            }
         }
     });
     if !substituted {
-        cmd.arg(line.as_str());
-    };
-    let mut child = cmd
-        .stdout(Stdio::piped())
-        .spawn()
-        .expect("deez nuts broken");
-    child.wait().expect("error during child process execution");
-    return Ok(child.stdout.expect("No stdout"));
+        command.push_str(job_input.as_str());
+    }
+    command
 }
-
 fn main() {
     let args = Args::parse();
     let input = io::stdin();
@@ -72,23 +61,31 @@ fn main() {
     let jobs = args.jobs.unwrap_or(thread_pool::max_par() - 1);
     let command = Arc::new(args.job);
 
-    let (job_sender, job_receiver) = bounded(jobs);
-    let (stdout_sender, stdout_receiver) = bounded(jobs);
+    let channel_size = jobs;
+    let (job_sender, job_receiver) = bounded(channel_size);
+    let (stdout_sender, stdout_receiver) = bounded(channel_size);
 
     let handles: Vec<JoinHandle<Result<(), ()>>> = (0..jobs)
         .map(|_| {
             let stdout_sender = stdout_sender.clone();
-            let this_command = Arc::clone(&command);
+            let command_args = Arc::clone(&command);
             let job_receiver = job_receiver.clone();
             return thread::spawn(move || -> Result<(), ()> {
+                let mut shell = Shell::birth();
                 // single receiver shared between all threads
                 for job in job_receiver {
                     match job {
                         Message::Job((i, job_input)) => {
-                            let res = the_thing(job_input, &this_command);
-                            stdout_sender.send((i, res?)).expect("hey");
+                            let command_args = command_args.clone();
+                            let command = parse_command(command_args, job_input);
+                            shell.feed(&command);
+                            let res = shell.harass();
+                            stdout_sender.send((i, res)).expect("Failed to send job to main thread");
                         }
-                        Message::Quit => break,
+                        Message::Quit => {
+                            shell.kill();
+                            break;
+                        }
                     }
                 }
                 Ok(())
@@ -98,9 +95,13 @@ fn main() {
 
     // all steps necessary in order to preparing to start
     drop(stdout_sender);
-    let mut lines_iter = input.lines().map(|res| res.expect("Error reading line from stdin")).enumerate().peekable();
+    let mut lines_iter = input
+        .lines()
+        .map(|res| res.expect("Error reading line from stdin"))
+        .enumerate()
+        .peekable();
     // fill jobs initially
-    for _ in 0..jobs {
+    for _ in 0..channel_size {
         let (i, line_res) = unsafe { lines_iter.next().unwrap_unchecked() };
         job_sender
             .send(Message::Job((i, line_res)))
@@ -110,11 +111,11 @@ fn main() {
     // TODO: Make this ordering thing into a function
     let mut next_customer = 0;
     let mut waiting_room: Vec<(usize, JobResult)> = Vec::new();
-    let mut stdout = std::io::stdout();
+    let mut stdout = std::io::stdout().lock();
     for (i, output) in stdout_receiver {
         // before calling waiting room function
         if lines_iter.peek().is_some() {
-            let n_messages_under = jobs - job_sender.len();
+            let n_messages_under = channel_size - job_sender.len();
             for _ in 0..n_messages_under {
                 match lines_iter.next() {
                     Some((id, job)) => {
@@ -137,7 +138,7 @@ fn main() {
             loop {
                 // portable function part
                 // increment next_customer and write to stdout
-                io::copy(&mut new_customer, &mut stdout).expect("Writing to stdout failed");
+                stdout.write_all(new_customer.as_slice()).expect("Failed to write to stdout");
                 // portable function part
                 next_customer += 1;
                 // check for next customer in waiting_room

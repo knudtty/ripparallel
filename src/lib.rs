@@ -1,3 +1,4 @@
+pub mod shell;
 pub mod thread_pool {
     use std::sync::Arc;
     use std::thread::{self, JoinHandle};

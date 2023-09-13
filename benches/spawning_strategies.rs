@@ -1,6 +1,7 @@
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use std::io::{Read, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use ripparallel::shell::{Shell, self};
 
 fn command_spawn(n: usize) {
     use std::fmt::Write;
@@ -23,7 +24,7 @@ fn command_spawn(n: usize) {
     write!(parent_stdout, "{}", output).expect("Failed to write to parent stdout");
 }
 
-fn command_shell(shell: &mut Shell, n: usize) {
+fn command_shell(shell: &mut BenchShell, n: usize) {
     // Spawn a new shell process
     let command = format!("echo {}", n.to_string());
     shell
@@ -53,12 +54,36 @@ fn command_shell(shell: &mut Shell, n: usize) {
     }
 }
 
-struct Shell {
+fn command_lib_shell(shell: &mut Shell, n: usize) {
+    // Spawn a new shell process
+    let command = format!("echo {}", n.to_string());
+    shell.feed(&command);
+    let mut output: Vec<u8> = Vec::new();
+    loop {
+        let mut buf = [0; 10];
+        //shell::WANT_BYTE
+        match shell.stdout.read(&mut buf) {
+            Ok(n_bytes_read) => {
+                output.extend(buf.iter().take(n_bytes_read));
+                let last_byte = buf.get(n_bytes_read - 1).unwrap();
+                let want_byte = b"\x04"[0];
+                if &want_byte == last_byte {
+                    break;
+                }
+            }
+            Err(_) => {
+                println!("ERROR");
+            }
+        }
+    }
+}
+
+struct BenchShell {
     slave: Child,
     stdin: ChildStdin,
     stdout: ChildStdout,
 }
-impl Shell {
+impl BenchShell {
     fn new() -> Self {
         // Spawn a new shell process
         let mut child = Command::new("sh")
@@ -72,7 +97,7 @@ impl Shell {
 
         let child_stdin = child.stdin.take().expect("Failed to open stdin");
         let child_stdout = child.stdout.take().expect("Failed to open stdout");
-        Shell {
+        BenchShell {
             slave: child,
             stdin: child_stdin,
             stdout: child_stdout,
@@ -82,16 +107,24 @@ impl Shell {
     fn kill(&mut self) {
         self.stdin
             .write(b"exit")
-            .expect("Failed to kill shell process");
+            .expect("Failed to send kill command");
+        self.slave.wait().expect("Failed to kill process");
     }
 }
+
 fn criterion_benchmark(c: &mut Criterion) {
     let n: usize = 1;
-    c.bench_function("command_spawn", |b| b.iter(|| command_spawn(black_box(n))));
+    //c.bench_function("command_spawn", |b| b.iter(|| command_spawn(black_box(n))));
 
-    c.bench_function("command_shell", |b| {
-        let mut shell = Shell::new();
-        b.iter(|| command_shell(&mut shell, black_box(n)));
+    //c.bench_function("command_shell", |b| {
+    //    let mut shell = BenchShell::new();
+    //    b.iter(|| command_shell(&mut shell, black_box(n)));
+    //    shell.kill();
+    //});
+
+    c.bench_function("command_lib_shell", |b| {
+        let mut shell = Shell::birth();
+        b.iter(|| command_lib_shell(&mut shell, black_box(n)));
         shell.kill();
     });
 }
