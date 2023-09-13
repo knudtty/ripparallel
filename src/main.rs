@@ -1,8 +1,9 @@
 use clap::Parser;
 use crossbeam_channel::bounded;
 use ripparallel::thread_pool;
-use std::io::{self, Write};
-use std::process::Command;
+use std::io;
+use std::process::Stdio;
+use std::process::{ChildStdout, Command};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 
@@ -30,9 +31,9 @@ enum Message {
     Quit,
 }
 
-type JobResult = Vec<u8>;
+type JobResult = ChildStdout;
 
-fn the_thing(line: String, command: &Arc<Vec<String>>) -> JobResult {
+fn the_thing(line: String, command: &Arc<Vec<String>>) -> Result<JobResult, ()> {
     // TODO: Construct command without sh -c
     let mut cmditer = command.iter();
     let mut cmd: Command;
@@ -56,8 +57,12 @@ fn the_thing(line: String, command: &Arc<Vec<String>>) -> JobResult {
     if !substituted {
         cmd.arg(line.as_str());
     };
-    let res = cmd.output().expect("deez nuts broken");
-    res.stdout.into()
+    let mut child = cmd
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("deez nuts broken");
+    child.wait().expect("error during child process execution");
+    return Ok(child.stdout.expect("No stdout"));
 }
 
 fn main() {
@@ -70,50 +75,49 @@ fn main() {
     let (job_sender, job_receiver) = bounded(jobs);
     let (stdout_sender, stdout_receiver) = bounded(jobs);
 
-    // job_sender.len()
-    let handles: Vec<JoinHandle<()>> = (0..jobs)
+    let handles: Vec<JoinHandle<Result<(), ()>>> = (0..jobs)
         .map(|_| {
             let stdout_sender = stdout_sender.clone();
             let this_command = Arc::clone(&command);
             let job_receiver = job_receiver.clone();
-            return thread::spawn(move || {
+            return thread::spawn(move || -> Result<(), ()> {
                 // single receiver shared between all threads
                 for job in job_receiver {
                     match job {
                         Message::Job((i, job_input)) => {
                             let res = the_thing(job_input, &this_command);
-                            stdout_sender.send((i, res)).unwrap();
-                        },
-                        Message::Quit => break
+                            stdout_sender.send((i, res?)).expect("hey");
+                        }
+                        Message::Quit => break,
                     }
                 }
+                Ok(())
             });
         })
         .collect();
 
     // all steps necessary in order to preparing to start
     drop(stdout_sender);
-    let mut lines_iter = input.lines().enumerate().peekable();
+    let mut lines_iter = input.lines().map(|res| res.expect("Error reading line from stdin")).enumerate().peekable();
     // fill jobs initially
     for _ in 0..jobs {
-        let (i, line_res) = lines_iter.next().unwrap();
+        let (i, line_res) = unsafe { lines_iter.next().unwrap_unchecked() };
         job_sender
-            .send(Message::Job((i, line_res.unwrap())))
-            .unwrap();
+            .send(Message::Job((i, line_res)))
+            .expect("Error sending job to thread");
     }
 
     // TODO: Make this ordering thing into a function
     let mut next_customer = 0;
     let mut waiting_room: Vec<(usize, JobResult)> = Vec::new();
     let mut stdout = std::io::stdout();
-    for (i, res) in stdout_receiver {
+    for (i, output) in stdout_receiver {
         // before calling waiting room function
         if lines_iter.peek().is_some() {
             let n_messages_under = jobs - job_sender.len();
-            //println!("n_messages_under: {}", n_messages_under);
             for _ in 0..n_messages_under {
                 match lines_iter.next() {
-                    Some((id, Ok(job))) => {
+                    Some((id, job)) => {
                         job_sender
                             .send(Message::Job((id, job)))
                             .expect("Broker: Unable to send job");
@@ -123,15 +127,17 @@ fn main() {
                 break;
             }
         } else {
-            job_sender.send(Message::Quit).expect("Unable to send quit message");
+            job_sender
+                .send(Message::Quit)
+                .expect("Unable to send quit message");
         }
         // before calling waiting room function
         if i == next_customer {
-            let mut new_customer = res;
+            let mut new_customer = output;
             loop {
                 // portable function part
                 // increment next_customer and write to stdout
-                stdout.write_all(new_customer.as_slice()).unwrap();
+                io::copy(&mut new_customer, &mut stdout).expect("Writing to stdout failed");
                 // portable function part
                 next_customer += 1;
                 // check for next customer in waiting_room
@@ -140,23 +146,19 @@ fn main() {
                     .position(|(customer, _)| customer == &next_customer)
                 {
                     // if found, copy entry to new_customer, copy last entry into indexed spot and pop last entry.
-                    let tmp = waiting_room.last().unwrap().clone();
-                    let entry = waiting_room.get_mut(idx).unwrap();
-                    new_customer = entry.1.clone();
-                    *entry = tmp;
-                    waiting_room.pop();
+                    new_customer = waiting_room.swap_remove(idx).1;
                 } else {
                     // else break loop
                     break;
                 }
             }
         } else {
-            waiting_room.push((i, res));
+            waiting_room.push((i, output));
         }
     }
 
     // Send lines to the channel from the main thread
     for handle in handles {
-        handle.join().unwrap();
+        let _ = handle.join();
     }
 }
