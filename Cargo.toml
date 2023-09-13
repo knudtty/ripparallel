@@ -17,3 +17,14 @@ bench = false
 clap = { version = "4.4.2", features = ["derive"] }
 crossbeam = "0.8.2"
 crossbeam-channel = "0.5.8"
+subprocess = "0.2.9"
+
+[profile.release]
+debug = true
+
+[dev-dependencies]
+criterion = { version = "0.4", features = ["html_reports"] }
+
+[[bench]]
+name = "spawning_strategies"
+harness = false
