@@ -1,21 +1,47 @@
 use std::io::{Read, Write};
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, Stdio};
 
-pub static WANT_BYTE: u8 = b"\x04"[0];
+static WANT_BYTE: u8 = b"\x04"[0];
+const BASH_LOOP: &'static str = "while true; do read line; if [ \"$line\" = \"exit\" ]; then exit; fi; ${line}; printf \"\x04\"; printf \"\x04\" >&2; done";
+const BUF_SIZE: usize = 50;
 
 pub struct Shell {
     #[allow(dead_code)]
     slave: Child,
-    pub stdin: ChildStdin,
-    pub stdout: ChildStdout,
+    stdin: ChildStdin,
+    stdout: ChildStdout,
+    stderr: ChildStderr,
 }
+
+pub struct StdOut(pub Vec<u8>);
+pub struct StdErr(pub Option<Vec<u8>>);
+type Execution = (StdOut, StdErr);
 impl Shell {
-    pub fn birth() -> Self {
-        //let bash_loop: String = format!("while true; do read line; if [ \"$line\" = \"exit\" ]; then exit; fi; eval \"$line; printf \"{}\"; done", WANT_BYTE);
+    pub fn new() -> Self {
+        return Self::birth(None, BASH_LOOP);
+    }
+
+    pub fn new_with(shell_name: &str) -> Self {
+        return Self::birth(Some(shell_name), BASH_LOOP);
+    }
+
+    pub fn execute(&mut self, command: String) -> Execution {
+        self.feed(&command);
+        return self.harass();
+    }
+
+    pub fn kill(&mut self) {
+        self.stdin
+            .write(b"exit\n")
+            .expect("Failed to kill shell process");
+        self.slave.wait().expect("Failed to kill process");
+    }
+
+    fn birth(shell_name: Option<&str>, bash_arg: &str) -> Self {
         // Spawn a new shell process
-        let mut child = Command::new("sh")
+        let mut child = Command::new(shell_name.unwrap_or("sh"))
             .arg("-c")
-            .arg("while true; do read line; if [ \"$line\" = \"exit\" ]; then exit; fi; eval \"$line; printf \"\x04\"\"; done")
+            .arg(bash_arg)
             .stdout(Stdio::piped())
             .stdin(Stdio::piped())
             .stderr(Stdio::piped())
@@ -24,14 +50,16 @@ impl Shell {
 
         let child_stdin = child.stdin.take().expect("Failed to open stdin");
         let child_stdout = child.stdout.take().expect("Failed to open stdout");
+        let child_stderr = child.stderr.take().expect("Failed to open stdout");
         Shell {
             slave: child,
             stdin: child_stdin,
             stdout: child_stdout,
+            stderr: child_stderr 
         }
     }
 
-    pub fn feed(&mut self, command: &String) {
+    fn feed(&mut self, command: &str) {
         self.stdin
             .write_all(command.as_bytes())
             .expect("Failed to write to stdin");
@@ -40,32 +68,56 @@ impl Shell {
             .expect("Failed to write newline to stdin");
     }
 
-    pub fn harass(&mut self) -> Vec<u8> {
-        let mut output: Vec<u8> = Vec::new();
+    fn harass(&mut self) -> Execution {
+        let mut stdout: Vec<u8> = Vec::new();
+        let mut stderr: Vec<u8> = Vec::new();
         loop {
-            let mut buf = [0; 10];
+            let mut buf = [0; BUF_SIZE];
             match self.stdout.read(&mut buf) {
-                Ok(0) => {}
+                Ok(0) => {
+                    if stdout.len() > 0 {
+                        break;
+                    }
+                }
                 Ok(n_bytes_read) => {
-                    output.extend(buf.iter().take(n_bytes_read));
-                    let last_byte = buf.get(n_bytes_read - 1).unwrap();
-                    let want_byte = b"\x04"[0];
-                    if &want_byte == last_byte {
+                    stdout.extend(buf.iter().take(n_bytes_read));
+                    let last_byte = &buf[n_bytes_read - 1];
+                    // TODO: Fix this bug. Shouldn't exit anytime it finds 4 at the end of the
+                    // buffer
+                    if WANT_BYTE == *last_byte && n_bytes_read < BUF_SIZE {
                         break;
                     }
                 }
                 Err(_) => {
-                    println!("ERROR");
+                    eprintln!("ERROR");
                 }
             }
         }
-        return output;
-    }
-
-    pub fn kill(&mut self) {
-        self.stdin
-            .write(b"exit\n")
-            .expect("Failed to kill shell process");
-        self.slave.wait().expect("Failed to kill process");
+        loop {
+            let mut buf = [0; BUF_SIZE];
+            match self.stderr.read(&mut buf) {
+                Ok(0) => {
+                    if stderr.len() > 0 {
+                        break;
+                    }
+                }
+                Ok(n_bytes_read) => {
+                    stderr.extend(buf.iter().take(n_bytes_read));
+                    let last_byte = &buf[n_bytes_read - 1];
+                    if WANT_BYTE == *last_byte {
+                        break;
+                    }
+                }
+                Err(_) => {
+                    eprintln!("ERROR");
+                }
+            }
+        }
+        // only 1 unit
+        if stderr.len() == 1 {
+            return (StdOut(stdout), StdErr(None));
+        }
+        let stderr: Vec<_> = Vec::new();
+        return (StdOut(stdout), StdErr(Some(stderr)));
     }
 }
