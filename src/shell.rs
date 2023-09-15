@@ -6,14 +6,24 @@ use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, Stdio};
 const BUF_SIZE: usize = 50;
 const RAND_STRING_SIZE: usize = 16;
 
-pub struct JobRes {
-    pub n_bytes: usize,
-    pub bytes: Box<[u8; BUF_SIZE]>, // TODO: Maybe box?
-}
-
 pub enum JobResult {
-    Partial(JobRes),
-    Completion(JobRes),
+    Partial(Vec<u8>),
+    Completion(Vec<u8>),
+}
+impl JobResult {
+    pub fn is_complete(&self) -> bool {
+        match self {
+            Self::Completion(_) => true,
+            Self::Partial(_) => false,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        match self {
+            Self::Completion(v) => v.is_empty(),
+            Self::Partial(v) => v.is_empty(),
+        }
+    }
 }
 
 pub struct Shell {
@@ -24,6 +34,8 @@ pub struct Shell {
     stderr: ChildStderr,
     end_string: String,
     sender: Sender,
+    last_bytes: [u8; RAND_STRING_SIZE],
+    cached_message: Vec<u8>,
 }
 
 type Sender = crossbeam_channel::Sender<(usize, JobResult)>;
@@ -72,6 +84,8 @@ impl Shell {
             stderr: child_stderr,
             end_string: child_end_string,
             sender,
+            last_bytes: [0; RAND_STRING_SIZE],
+            cached_message: vec![],
         }
     }
 
@@ -84,54 +98,134 @@ impl Shell {
             .expect("Failed to write newline to stdin");
     }
 
-    fn process_is_complete(bytes_read: usize, buf: &[u8; BUF_SIZE], end_bytes: &[u8]) -> bool {
-        let bytes_len = end_bytes.len();
-        if bytes_read < bytes_len {
-            return false;
-        }
-        for (bytes_i, buf_i) in ((bytes_read - bytes_len)..bytes_read).enumerate() {
-            let stdout_byte = buf.get(buf_i).unwrap();
-            let bytes_byte = end_bytes.get(bytes_i).unwrap();
-            if stdout_byte != bytes_byte {
-                return false;
+    fn process_is_complete(&mut self) -> bool {
+        return self.last_bytes == self.end_string.as_bytes();
+    }
+    fn update_last_bytes(&mut self, buf: &Vec<u8>) {
+        let buf_len = buf.len();
+        if buf.len() >= RAND_STRING_SIZE {
+            let idx = buf_len - RAND_STRING_SIZE;
+            self.last_bytes.copy_from_slice(&buf[idx..]);
+        } else {
+            let idx = RAND_STRING_SIZE - buf_len;
+            self.last_bytes.copy_within(idx.., 0);
+            for i in 0..buf_len {
+                self.last_bytes[i + idx] = buf[i];
             }
         }
-        return true;
     }
 
     fn send(&mut self, job: (usize, JobResult)) {
-        self.sender.send(job).expect("Failed to send");
+        if !job.1.is_empty() {
+            self.sender.send(job).expect("Failed to send");
+        }
     }
 
     fn harass(&mut self, job_id: usize) {
+        //eprintln!("received job {}", job_id);
         // figure out streaming stdout and stderr back
+        // TODO: Figure out stderr. I think it should be flushed based on line break
         loop {
-            //let mut stdout: Vec<u8> = Vec::new();
-            //let mut stderr: Vec<u8> = Vec::new();
             let mut buf = [0; BUF_SIZE];
+            //let mut stderr: Vec<u8> = Vec::new();
             match self.stdout.read(&mut buf) {
                 Ok(0) => {
-                    eprintln!("Stuck reading 0");
+                    //eprintln!("Stuck reading 0");
                 }
                 Ok(n_bytes_read) => {
-                    if Shell::process_is_complete(n_bytes_read, &buf, self.end_string.as_bytes()) {
-                        self.send((
-                            job_id,
-                            JobResult::Completion(JobRes {
-                                n_bytes: n_bytes_read - RAND_STRING_SIZE,
-                                bytes: Box::new(buf),
-                            }),
-                        ));
-                        break;
+                    // child stdout is received
+                    // read into a vec
+                    // if incoming message is >= RAND_STRING_SIZE
+                    //      last bytes are updated from incoming message
+                    //      if last bytes == RAND_STRING_SIZE
+                    //          send old message as Complete
+                    //          old message is set to zero
+                    //      else
+                    //          send old message as Partial
+                    //          old message is set to new message
+                    // else if incoming message is + old message > RAND_STRING_SIZE
+                    //      last bytes are updated from incoming message and old message
+                    //      if last bytes == RAND_STRING_SIZE
+                    //          message is stripped of last bytes
+                    //          message is sent as Complete
+                    //          old message is set to zero
+                    //      else
+                    //          message is constructed of [incoming message + old message][0..len - RAND_STRING_SIZE]
+                    //          message is sent as Partial
+                    //          old message is set to remaining
+                    // else (implicitly incoming message + old message < RAND_STRING_SIZE)
+                    //      old message message is extended with incoming message
+                    //      nothing is sent
+                    //      last bytes are updated
+                    //
+                    //
+                    let stdout: Vec<u8> = buf[0..n_bytes_read].to_vec();
+                    if stdout.len() >= RAND_STRING_SIZE {
+                        self.update_last_bytes(&stdout);
+                        if self.process_is_complete() {
+                            // potentially unnecessary construction
+                            //eprintln!("Sending completion");
+                            let mut new_message = self.cached_message.clone();
+                            new_message.extend_from_slice(&stdout[..]);
+                            self.send((
+                                job_id,
+                                JobResult::Completion(
+                                    new_message[..(new_message.len() - RAND_STRING_SIZE)].to_vec(),
+                                ),
+                            ));
+                            self.cached_message = vec![];
+                            break;
+                        } else {
+                            self.send((job_id, JobResult::Partial(self.cached_message.clone())));
+                            self.cached_message = stdout;
+                        }
+                    } else if stdout.len() + self.cached_message.len() > RAND_STRING_SIZE {
+                        //let new_message =
+                        let mut new_message = self.cached_message.clone();
+                        new_message.extend_from_slice(&stdout[..]);
+                        self.update_last_bytes(&new_message);
+                        if self.process_is_complete() {
+                            self.send((
+                                job_id,
+                                JobResult::Completion(
+                                    new_message[..(new_message.len() - RAND_STRING_SIZE)].to_vec(),
+                                ),
+                            ));
+                            self.cached_message = vec![];
+                            break;
+                        } else {
+                            // TODO: Look into sending the bytes up to len - RAND_STRING_SIZE.
+                            // Potentailly not necessary.
+                            self.cached_message = new_message;
+                        }
                     } else {
-                        self.send((
-                            job_id,
-                            JobResult::Partial(JobRes {
-                                n_bytes: n_bytes_read,
-                                bytes: Box::new(buf),
-                            }),
-                        ));
-                    };
+                        let mut new_message = self.cached_message.clone();
+                        new_message.extend_from_slice(&stdout[..]);
+                        self.update_last_bytes(&new_message);
+                        self.cached_message = new_message;
+                    }
+                    //eprintln!("Cached message: {} end", String::from_utf8(self.cached_message.clone()).unwrap());
+                    //self.update_last_bytes(&stdout);
+                    //if self.message_is_cleared() {
+                    //    if self.process_is_complete() {
+                    //        self.send((
+                    //            job_id,
+                    //            JobResult::Completion(JobRes {
+                    //                n_bytes: n_bytes_read,
+                    //                bytes: stdout,
+                    //            }),
+                    //        ));
+                    //        break;
+                    //    } else {
+                    //        self.send((
+                    //            job_id,
+                    //            JobResult::Partial(JobRes {
+                    //                n_bytes: n_bytes_read,
+                    //                bytes: stdout,
+                    //            }),
+                    //        ));
+                    //    };
+                    //}
                 }
                 Err(_) => {
                     eprintln!("ERROR");

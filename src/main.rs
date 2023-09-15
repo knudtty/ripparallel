@@ -2,6 +2,7 @@ use clap::Parser;
 use crossbeam_channel::{unbounded, Sender};
 use ripparallel::shell::{JobResult, Shell};
 use ripparallel::thread_pool;
+use std::collections::{hash_map::Entry, HashMap};
 use std::io::{self, Write};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
@@ -85,11 +86,11 @@ fn main() {
                 // single receiver shared between all threads
                 for job in job_receiver {
                     match job {
-                        Message::Job((i, job_input)) => {
+                        Message::Job((id, job_input)) => {
+                            //eprintln!("receiving message {}", id);
                             let command_args = command_args.clone();
                             let command = parse_command(command_args, job_input);
-                            //eprintln!("id of job: {}", i);
-                            shell.execute(command, i);
+                            shell.execute(command, id);
                         }
                         Message::Quit => {
                             shell.kill();
@@ -131,87 +132,77 @@ fn main() {
     //
     // TODO: Make this ordering thing into a function
     let mut next_customer = 0;
-    let mut waiting_room: Vec<(usize, Vec<JobResult>)> = Vec::new();
+    let mut waiting_room: HashMap<usize, Vec<JobResult>> = HashMap::new();
     let mut stdout = std::io::stdout();
     for (i, new_output) in stdout_receiver {
-        //eprintln!("new line");
         // before calling waiting room function
-        if lines_iter.peek().is_some() {
+        if new_output.is_complete() && job_sender.len() < channel_size {
             let n_messages_under = channel_size - job_sender.len();
             //eprintln!("messages under: {}", n_messages_under);
             for _ in 0..n_messages_under {
                 match lines_iter.next() {
                     Some((id, job)) => {
+                        //eprintln!("sending message {}", id);
                         job_sender
                             .send(Message::Job((id, job)))
                             .expect("Broker: Unable to send job");
                     }
-                    _ => {
-                        break;
+                    None => {
+                        job_sender
+                            .send(Message::Quit)
+                            .expect("Unable to send quit message");
                     }
                 }
             }
-        } else {
-            job_sender
-                .send(Message::Quit)
-                .expect("Unable to send quit message");
         }
-        // before calling waiting room function
-        if i == next_customer {
-            // portable function part
-            // increment next_customer and write to stdout
-            match new_output {
-                JobResult::Partial(res) => {
-                    stdout
-                        .write(&res.bytes[0..res.n_bytes])
-                        .expect("Failed to write to stdout");
-                }
-                JobResult::Completion(res) => {
-                    stdout
-                        .write(&res.bytes[0..res.n_bytes])
-                        .expect("Failed to write to stdout");
-                    next_customer += 1;
-                }
+        match (i, new_output) {
+            (i, JobResult::Partial(res)) if i == next_customer => {
+                stdout
+                    .write(&res)
+                    .expect("Failed to write to stdout");
             }
-            loop {
-                // check for next customer in waiting_room
-                if let Some(idx) = waiting_room
-                    .iter()
-                    .position(|(customer, _)| customer == &next_customer)
-                {
+            (i, JobResult::Completion(res)) if i == next_customer => {
+                stdout
+                    .write(&res)
+                    .expect("Failed to write to stdout");
+                next_customer += 1;
+                // write waiting customer to stdout
+                loop {
+                    // check for next customer in waiting_room
                     // if found, copy entry to new_customer, copy last entry into indexed spot and pop last entry.
-                    let v = waiting_room.swap_remove(idx).1;
-                    v.iter().for_each(|job_res| match job_res {
-                        JobResult::Partial(res) => {
-                            stdout
-                                .write(&res.bytes[0..res.n_bytes])
-                                .expect("Failed to write to stdout");
+                    let mut complete = false;
+                    match waiting_room.remove(&next_customer) {
+                        Some(v) => {
+                            v.iter().for_each(|job_res| match job_res {
+                                JobResult::Partial(res) => {
+                                    stdout
+                                        .write(&res)
+                                        .expect("Failed to write to stdout");
+                                }
+                                JobResult::Completion(res) => {
+                                    stdout
+                                        .write(&res)
+                                        .expect("Failed to write to stdout");
+                                    complete = true;
+                                }
+                            });
+                            if complete {
+                                next_customer += 1;
+                            }
                         }
-                        JobResult::Completion(res) => {
-                            stdout
-                                .write(&res.bytes[0..res.n_bytes])
-                                .expect("Failed to write to stdout");
-                            next_customer += 1;
-                        }
-                    });
-                } else {
-                    break;
+                        None => break,
+                    }
                 }
             }
-        } else {
-            if let Some(idx) = waiting_room
-                .iter()
-                .position(|(customer, _)| customer == &next_customer)
-            {
-                waiting_room.get_mut(idx).unwrap().1.push(new_output);
-            } else {
-                //eprintln!("pushing");
-                let mut v = Vec::new();
-                v.push(new_output);
-                waiting_room.push((i, v));
-            }
+            (i, res) => match waiting_room.entry(i) {
+                Entry::Occupied(mut entry) => {
+                    entry.get_mut().push(res);
+                }
+                Entry::Vacant(entry) => {
+                    entry.insert(vec![res]);
+                }
+            },
         }
-        //eprintln!("i is {}", i);
     }
 
     // Send lines to the channel from the main thread
