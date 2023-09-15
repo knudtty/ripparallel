@@ -1,9 +1,20 @@
+use crossbeam_channel;
 use rand::distributions::{Alphanumeric, DistString};
 use std::io::{Read, Write};
 use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, Stdio};
 
 const BUF_SIZE: usize = 50;
 const RAND_STRING_SIZE: usize = 16;
+
+pub struct JobRes {
+    pub n_bytes: usize,
+    pub bytes: Box<[u8; BUF_SIZE]>, // TODO: Maybe box?
+}
+
+pub enum JobResult {
+    Partial(JobRes),
+    Completion(JobRes),
+}
 
 pub struct Shell {
     slave: Child,
@@ -12,24 +23,23 @@ pub struct Shell {
     #[allow(dead_code)]
     stderr: ChildStderr,
     end_string: String,
+    sender: Sender,
 }
 
-pub struct StdOut(pub Vec<u8>);
-pub struct StdErr(pub Option<Vec<u8>>);
-type Execution = (StdOut, StdErr);
-
+type Sender = crossbeam_channel::Sender<(usize, JobResult)>;
+pub type Execution = Option<(Vec<u8>, Option<Vec<u8>>)>;
 impl Shell {
-    pub fn new() -> Self {
-        return Self::birth(None);
+    pub fn new(sender: Sender) -> Self {
+        return Self::birth(None, sender);
     }
 
-    pub fn new_with(shell_name: &str) -> Self {
-        return Self::birth(Some(shell_name));
+    pub fn new_with(shell_name: &str, sender: Sender) -> Self {
+        return Self::birth(Some(shell_name), sender);
     }
 
-    pub fn execute(&mut self, command: String) -> Execution {
+    pub fn execute(&mut self, command: String, job_id: usize) {
         self.feed(&command);
-        return self.harass();
+        self.harass(job_id);
     }
 
     pub fn kill(&mut self) {
@@ -39,9 +49,10 @@ impl Shell {
         self.slave.wait().expect("Failed to kill process");
     }
 
-    fn birth(shell_name: Option<&str>) -> Self {
+    fn birth(shell_name: Option<&str>, sender: Sender) -> Self {
         // Spawn a new shell process
-        let child_end_string = Alphanumeric.sample_string(&mut rand::thread_rng(), RAND_STRING_SIZE);
+        let child_end_string =
+            Alphanumeric.sample_string(&mut rand::thread_rng(), RAND_STRING_SIZE);
         let mut child = Command::new(shell_name.unwrap_or("sh"))
             .arg("-c")
             .arg(format!("while true; do read line; if [ \"$line\" = \"exit\" ]; then exit; fi; $line; printf {}; done", child_end_string))
@@ -60,6 +71,7 @@ impl Shell {
             stdout: child_stdout,
             stderr: child_stderr,
             end_string: child_end_string,
+            sender,
         }
     }
 
@@ -72,38 +84,53 @@ impl Shell {
             .expect("Failed to write newline to stdin");
     }
 
-    fn process_is_complete(end_bytes: &[u8], stdout: &Vec<u8>) -> bool {
+    fn process_is_complete(bytes_read: usize, buf: &[u8; BUF_SIZE], end_bytes: &[u8]) -> bool {
         let bytes_len = end_bytes.len();
-        let stdout_len = stdout.len();
-        if stdout_len < bytes_len {
-            return false
+        if bytes_read < bytes_len {
+            return false;
         }
-        for (bytes_i, stdout_i) in ((stdout_len - bytes_len)..stdout_len).enumerate() {
-            let stdout_byte = stdout.get(stdout_i).unwrap();
+        for (bytes_i, buf_i) in ((bytes_read - bytes_len)..bytes_read).enumerate() {
+            let stdout_byte = buf.get(buf_i).unwrap();
             let bytes_byte = end_bytes.get(bytes_i).unwrap();
             if stdout_byte != bytes_byte {
-                return false
+                return false;
             }
         }
-        return true
-
+        return true;
     }
 
-    fn harass(&mut self) -> Execution {
-        let mut stdout: Vec<u8> = Vec::new();
-        let mut stderr: Vec<u8> = Vec::new();
+    fn send(&mut self, job: (usize, JobResult)) {
+        self.sender.send(job).expect("Failed to send");
+    }
+
+    fn harass(&mut self, job_id: usize) {
         // figure out streaming stdout and stderr back
         loop {
+            //let mut stdout: Vec<u8> = Vec::new();
+            //let mut stderr: Vec<u8> = Vec::new();
             let mut buf = [0; BUF_SIZE];
             match self.stdout.read(&mut buf) {
                 Ok(0) => {
                     eprintln!("Stuck reading 0");
                 }
                 Ok(n_bytes_read) => {
-                    stdout.extend(buf.iter().take(n_bytes_read));
-                    if Shell::process_is_complete(self.end_string.as_bytes(), &stdout) {
-                        stdout.truncate(stdout.len() - self.end_string.len());
+                    if Shell::process_is_complete(n_bytes_read, &buf, self.end_string.as_bytes()) {
+                        self.send((
+                            job_id,
+                            JobResult::Completion(JobRes {
+                                n_bytes: n_bytes_read - RAND_STRING_SIZE,
+                                bytes: Box::new(buf),
+                            }),
+                        ));
                         break;
+                    } else {
+                        self.send((
+                            job_id,
+                            JobResult::Partial(JobRes {
+                                n_bytes: n_bytes_read,
+                                bytes: Box::new(buf),
+                            }),
+                        ));
                     };
                 }
                 Err(_) => {
@@ -111,6 +138,7 @@ impl Shell {
                 }
             }
         }
+
         //loop {
         //    let mut buf = [0; BUF_SIZE];
         //    match self.stderr.read(&mut buf) {
@@ -132,10 +160,5 @@ impl Shell {
         //    }
         //}
         // only 1 unit
-        if stderr.len() == 1 {
-            return (StdOut(stdout), StdErr(None));
-        }
-        let stderr: Vec<_> = Vec::new();
-        return (StdOut(stdout), StdErr(Some(stderr)));
     }
 }
