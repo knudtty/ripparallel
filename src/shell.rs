@@ -125,8 +125,9 @@ impl Shell {
         //eprintln!("received job {}", job_id);
         // figure out streaming stdout and stderr back
         // TODO: Figure out stderr. I think it should be flushed based on line break
+        let mut buf_size = 50;
         loop {
-            let mut buf = [0; BUF_SIZE];
+            let mut buf = vec![0; buf_size];
             //let mut stderr: Vec<u8> = Vec::new();
             match self.stdout.read(&mut buf) {
                 Ok(0) => {
@@ -159,6 +160,9 @@ impl Shell {
                     //      last bytes are updated
                     //
                     //
+                    if n_bytes_read == buf_size {
+                        buf_size = buf_size * 14/10;
+                    }
                     let stdout: Vec<u8> = buf[0..n_bytes_read].to_vec();
                     if stdout.len() >= RAND_STRING_SIZE {
                         self.update_last_bytes(&stdout);
