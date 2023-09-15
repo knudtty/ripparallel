@@ -3,7 +3,7 @@ use rand::distributions::{Alphanumeric, DistString};
 use std::io::{Read, Write};
 use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, Stdio};
 
-const BUF_SIZE: usize = 50;
+const BUF_SIZE: usize = 1024;
 const RAND_STRING_SIZE: usize = 16;
 
 pub enum JobResult {
