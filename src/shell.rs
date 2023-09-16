@@ -3,7 +3,6 @@ use rand::distributions::{Alphanumeric, DistString};
 use std::io::{Read, Write};
 use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, Stdio};
 
-const BUF_SIZE: usize = 1024;
 const RAND_STRING_SIZE: usize = 16;
 
 pub enum JobResult {
@@ -116,9 +115,7 @@ impl Shell {
     }
 
     fn send(&mut self, job: (usize, JobResult)) {
-        if !job.1.is_empty() {
-            self.sender.send(job).expect("Failed to send");
-        }
+        self.sender.send(job).expect("Failed to send");
     }
 
     fn harass(&mut self, job_id: usize) {
@@ -160,9 +157,6 @@ impl Shell {
                     //      last bytes are updated
                     //
                     //
-                    if n_bytes_read == buf_size {
-                        buf_size = buf_size * 14/10;
-                    }
                     let stdout: Vec<u8> = buf[0..n_bytes_read].to_vec();
                     if stdout.len() >= RAND_STRING_SIZE {
                         self.update_last_bytes(&stdout);
@@ -207,6 +201,9 @@ impl Shell {
                         new_message.extend_from_slice(&stdout[..]);
                         self.update_last_bytes(&new_message);
                         self.cached_message = new_message;
+                    }
+                    if n_bytes_read == buf_size {
+                        buf_size = buf_size * 14 / 10;
                     }
                     //eprintln!("Cached message: {} end", String::from_utf8(self.cached_message.clone()).unwrap());
                     //self.update_last_bytes(&stdout);
