@@ -2,7 +2,8 @@ use rand::distributions::{Alphanumeric, DistString};
 use std::io::Write;
 use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, Stdio};
 
-const RAND_STRING_SIZE: usize = 16;
+pub const RAND_STRING_SIZE: usize = 16;
+pub type EndBytes = [u8; RAND_STRING_SIZE];
 
 pub struct Shell {
     slave: Child,
@@ -62,7 +63,7 @@ impl Shell {
             .expect("Failed to write newline to stdin");
     }
 
-    pub fn process_is_complete(end_bytes: &[u8], stdout: &Vec<u8>) -> bool {
+    pub fn process_is_complete(end_bytes: &[u8], stdout: &[u8]) -> bool {
         let bytes_len = end_bytes.len();
         let stdout_len = stdout.len();
         if stdout_len < bytes_len {
