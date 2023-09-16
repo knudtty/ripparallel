@@ -115,7 +115,7 @@ fn handle_reads(
         uncleared_message.extend_from_slice(&buf[..n_bytes_read]);
         Vec::with_capacity(0) // TODO: MAke into an option
     };
-    update_byte_history(byte_history, &buf[..n_bytes_read]);
+    update_byte_history(byte_history, &uncleared_message);
     let complete = Shell::process_is_complete(end_indication_bytes, byte_history);
     // Probably have to hold the state of the last 16 bytes in case it spans across byte
     // boundaries.
