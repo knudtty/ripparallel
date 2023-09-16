@@ -1,8 +1,8 @@
 use clap::Parser;
 use crossbeam_channel::unbounded;
-use ripparallel::shell::{Shell, StdErr, StdOut};
+use ripparallel::shell::Shell;
 use ripparallel::thread_pool;
-use std::io::{self, Write};
+use std::io::{self, Write, Read};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 
@@ -83,7 +83,39 @@ fn main() {
                         Message::Job((i, job_input)) => {
                             let command_args = command_args.clone();
                             let command = parse_command(command_args, job_input);
-                            let (StdOut(stdout), StdErr(_stderr)) = shell.execute(command);
+                            shell.feed(command);
+                            let mut stdout: Vec<u8> = Vec::new();
+                            //let mut stderr: Vec<u8> = Vec::new();
+                            // figure out streaming stdout and stderr back
+                            let mut buf_size = 50; // starting bufsize
+                            loop {
+                                let mut buf = vec![0; buf_size]; // I have found no performance
+                                                                 // loss using a vec over a stack
+                                                                 // allocated array. Also I can do
+                                                                 // dynamic growth now.
+                                match shell.stdout.read(&mut buf) {
+                                    Ok(0) => {
+                                        eprintln!("Stuck reading 0");
+                                    }
+                                    Ok(n_bytes_read) => {
+                                        stdout.extend(buf.iter().take(n_bytes_read));
+                                        if Shell::process_is_complete(
+                                            shell.end_string.as_bytes(),
+                                            &stdout,
+                                        ) {
+                                            stdout.truncate(stdout.len() - shell.end_string.len());
+                                            break;
+                                        };
+                                        if buf_size == n_bytes_read {
+                                            buf_size = (buf_size * 14 / 10).min(2048);
+                                        }
+                                    }
+                                    Err(_) => {
+                                        eprintln!("ERROR");
+                                    }
+                                }
+                            }
+                            //let stderr: Vec<_> = Vec::new();
                             stdout_sender
                                 .send((i, stdout))
                                 .expect("Failed to send job to main thread");

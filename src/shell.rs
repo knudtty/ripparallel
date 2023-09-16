@@ -1,22 +1,17 @@
 use rand::distributions::{Alphanumeric, DistString};
-use std::io::{Read, Write};
+use std::io::Write;
 use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, Stdio};
 
-const BUF_SIZE: usize = 50;
 const RAND_STRING_SIZE: usize = 16;
 
 pub struct Shell {
     slave: Child,
     stdin: ChildStdin,
-    stdout: ChildStdout,
+    pub stdout: ChildStdout,
     #[allow(dead_code)]
-    stderr: ChildStderr,
-    end_string: String,
+    pub stderr: ChildStderr,
+    pub end_string: String,
 }
-
-pub struct StdOut(pub Vec<u8>);
-pub struct StdErr(pub Option<Vec<u8>>);
-type Execution = (StdOut, StdErr);
 
 impl Shell {
     pub fn new() -> Self {
@@ -25,11 +20,6 @@ impl Shell {
 
     pub fn new_with(shell_name: &str) -> Self {
         return Self::birth(Some(shell_name));
-    }
-
-    pub fn execute(&mut self, command: String) -> Execution {
-        self.feed(&command);
-        return self.harass();
     }
 
     pub fn kill(&mut self) {
@@ -63,7 +53,7 @@ impl Shell {
         }
     }
 
-    fn feed(&mut self, command: &str) {
+    pub fn feed(&mut self, command: String) {
         self.stdin
             .write_all(command.as_bytes())
             .expect("Failed to write to stdin");
@@ -72,7 +62,7 @@ impl Shell {
             .expect("Failed to write newline to stdin");
     }
 
-    fn process_is_complete(end_bytes: &[u8], stdout: &Vec<u8>) -> bool {
+    pub fn process_is_complete(end_bytes: &[u8], stdout: &Vec<u8>) -> bool {
         let bytes_len = end_bytes.len();
         let stdout_len = stdout.len();
         if stdout_len < bytes_len {
@@ -87,55 +77,5 @@ impl Shell {
         }
         return true
 
-    }
-
-    fn harass(&mut self) -> Execution {
-        let mut stdout: Vec<u8> = Vec::new();
-        let mut stderr: Vec<u8> = Vec::new();
-        // figure out streaming stdout and stderr back
-        loop {
-            let mut buf = [0; BUF_SIZE];
-            match self.stdout.read(&mut buf) {
-                Ok(0) => {
-                    eprintln!("Stuck reading 0");
-                }
-                Ok(n_bytes_read) => {
-                    stdout.extend(buf.iter().take(n_bytes_read));
-                    if Shell::process_is_complete(self.end_string.as_bytes(), &stdout) {
-                        stdout.truncate(stdout.len() - self.end_string.len());
-                        break;
-                    };
-                }
-                Err(_) => {
-                    eprintln!("ERROR");
-                }
-            }
-        }
-        //loop {
-        //    let mut buf = [0; BUF_SIZE];
-        //    match self.stderr.read(&mut buf) {
-        //        Ok(0) => {
-        //            if stderr.len() > 0 {
-        //                break;
-        //            }
-        //        }
-        //        Ok(n_bytes_read) => {
-        //            stderr.extend(buf.iter().take(n_bytes_read));
-        //            let last_byte = &buf[n_bytes_read - 1];
-        //            if WANT_BYTE == *last_byte {
-        //                break;
-        //            }
-        //        }
-        //        Err(_) => {
-        //            eprintln!("ERROR");
-        //        }
-        //    }
-        //}
-        // only 1 unit
-        if stderr.len() == 1 {
-            return (StdOut(stdout), StdErr(None));
-        }
-        let stderr: Vec<_> = Vec::new();
-        return (StdOut(stdout), StdErr(Some(stderr)));
     }
 }
