@@ -2,10 +2,13 @@ use clap::Parser;
 use crossbeam_channel::unbounded;
 use ripparallel::shell::{EndBytes, Shell, RAND_STRING_SIZE};
 use ripparallel::thread_pool;
-use std::fs::{self, File};
-use std::io::{self, Read, Write};
+use std::fs::File;
+use std::io::{self, Read, Write, Seek};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
+
+const MAX_MEMORY_SIZE: usize = 1048; // 2 kb
+const CACHE_SIZE: usize = 2048; // 2 kb
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None, trailing_var_arg = true)]
@@ -34,8 +37,8 @@ enum Message {
 #[derive(Debug)]
 enum JobOut {
     #[allow(dead_code)]
-    FileHandle(File, String),
-    InMemory(Vec<u8>),
+    File(File),
+    Memory(Vec<u8>),
     None,
 }
 
@@ -88,6 +91,7 @@ fn handle_reads(
     end_indication_bytes: &[u8],
     byte_history: &mut [u8; RAND_STRING_SIZE],
     uncleared_message: &mut Vec<u8>,
+    cached_message: &mut Vec<u8>
 ) -> (JobOut, bool) {
     let cleared_message = if n_bytes_read >= RAND_STRING_SIZE {
         let last_message_bytes = n_bytes_read - RAND_STRING_SIZE;
@@ -120,16 +124,40 @@ fn handle_reads(
     // Probably have to hold the state of the last 16 bytes in case it spans across byte
     // boundaries.
     let job = match job {
-        JobOut::InMemory(mut v) => {
+        JobOut::Memory(mut v) => {
             if let Some(cleared) = cleared_message {
-                v.extend_from_slice(&cleared);
+                if v.len() + cleared.len() > MAX_MEMORY_SIZE {
+                    let mut f = tempfile::tempfile().expect("Failed to create tempfile");
+                    f.write_all(&v).expect("Failed to write to file");
+                    f.write_all(&cleared).expect("Failed to write to file");
+                    //let mut buf = String::new();
+                    //f.read_to_string(&mut buf);
+                    //println!("{}", buf);
+                    JobOut::File(f)
+                } else {
+                    v.extend_from_slice(&cleared);
+                    JobOut::Memory(v)
+                }
+            } else {
+                JobOut::Memory(v)
             }
-            JobOut::InMemory(v)
         }
-        JobOut::FileHandle(f, _path) => JobOut::FileHandle(f, "".to_owned()),
+        JobOut::File(mut f) => {
+            if let Some(cleared) = cleared_message {
+                if complete || cleared.len() + cached_message.len() > CACHE_SIZE {
+                    //println!("writing: {:?}", cleared);
+                    f.write_all(&cached_message).expect("Failed to write to file");
+                    f.write_all(&cleared).expect("Failed to write to file");
+                    *cached_message = vec![];
+                } else {
+                    cached_message.extend_from_slice(&cleared);
+                }
+            } 
+            JobOut::File(f)
+        }
         JobOut::None => {
-            if n_bytes_read > 0 && cleared_message.is_some() {
-                JobOut::InMemory(cleared_message.unwrap())
+            if cleared_message.is_some() {
+                JobOut::Memory(cleared_message.unwrap())
             } else {
                 JobOut::None
             }
@@ -171,6 +199,7 @@ fn main() {
                             let mut complete: bool;
                             let mut byte_history: [u8; RAND_STRING_SIZE] = [0; RAND_STRING_SIZE];
                             let mut uncleared_message = Vec::new();
+                            let mut cached_message = Vec::new();
                             loop {
                                 let mut buf = vec![0; buf_size]; // I have found no performance
                                                                  // loss using a vec over a stack
@@ -188,6 +217,7 @@ fn main() {
                                             shell.end_string.as_bytes(),
                                             &mut byte_history,
                                             &mut uncleared_message,
+                                            &mut cached_message
                                         );
                                         if complete {
                                             stdout_sender
@@ -226,7 +256,6 @@ fn main() {
     // fill jobs initially
     for _ in 0..channel_size {
         let (i, line_res) = lines_iter.next().unwrap();
-        //let (i, line_res) = (0, "2".to_owned());
         job_sender
             .send(Message::Job((i, line_res)))
             .expect("Error sending job to thread");
@@ -263,23 +292,25 @@ fn main() {
                 // portable function part
                 // increment next_customer and write to stdout
                 match job_output {
-                    JobOut::FileHandle(mut f, path) => {
+                    JobOut::File(mut f) => {
+                        f.seek(io::SeekFrom::Start(0)).expect("Failed to return to start");
                         io::copy(&mut f, &mut stdout).expect("Failed to write file to stdout");
-                        fs::remove_file(path).expect("Failed to remove stdout file");
+                        drop(f); // signals to the OS to remove the tempfile
                     }
-                    JobOut::InMemory(v) => {
+                    JobOut::Memory(v) => {
                         stdout
                             .write_all(v.as_slice())
                             .expect("Failed to write to stdout");
                     }
-                    JobOut::None => { /* do nothing */ }
+                    JobOut::None => { 
+                        /* do nothing */ }
                 }
                 match job_err {
-                    JobOut::FileHandle(mut f, path) => {
+                    JobOut::File(mut f) => {
                         io::copy(&mut f, &mut stderr).expect("Failed to write file to stdout");
-                        fs::remove_file(path).expect("Failed to remove stderr file");
+                        drop(f);
                     }
-                    JobOut::InMemory(v) => {
+                    JobOut::Memory(v) => {
                         stderr
                             .write_all(v.as_slice())
                             .expect("Failed to write to stdout");
