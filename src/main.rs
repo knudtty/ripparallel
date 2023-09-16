@@ -32,6 +32,7 @@ enum Message {
 }
 
 enum JobOut {
+    #[allow(dead_code)]
     FileHandle(File, String),
     InMemory(Vec<u8>),
     None,
@@ -67,6 +68,7 @@ fn parse_command(command_args: Arc<Vec<String>>, job_input: String) -> String {
 
 fn update_byte_history(byte_history: &mut EndBytes, buf: &[u8]) {
     let buf_len = buf.len();
+    //eprintln!("Updating on buf len {}", buf_len);
     if buf.len() >= RAND_STRING_SIZE {
         let idx = buf_len - RAND_STRING_SIZE;
         byte_history.copy_from_slice(&buf[idx..]);
@@ -85,29 +87,47 @@ fn handle_reads(
     n_bytes_read: usize,
     end_indication_bytes: &[u8],
     byte_history: &mut [u8; RAND_STRING_SIZE],
-    uncleared_message: &mut Vec<u8>
+    uncleared_message: &mut Vec<u8>,
 ) -> (JobOut, bool) {
-    //if n_bytes_read >= RAND_STRING_SIZE {
-    //    update_byte_history(byte_history, &buf[..n_bytes_read]);
-    //}
+    let cleared_message = if n_bytes_read >= RAND_STRING_SIZE {
+        let last_message_bytes = n_bytes_read - RAND_STRING_SIZE;
+        let mut cleared_message = uncleared_message.clone();
+        cleared_message.extend_from_slice(&buf[..last_message_bytes]);
+        *uncleared_message = buf[last_message_bytes..n_bytes_read].to_vec();
+        cleared_message
+    } else if n_bytes_read + uncleared_message.len() > RAND_STRING_SIZE {
+        let n_bytes = n_bytes_read + uncleared_message.len();
+        let cleared_message = if n_bytes - RAND_STRING_SIZE >= uncleared_message.len() {
+            uncleared_message.to_owned()
+        } else {
+            uncleared_message[..n_bytes - RAND_STRING_SIZE].to_vec()
+        };
+        *uncleared_message = if n_bytes - RAND_STRING_SIZE >= uncleared_message.len() {
+            buf[n_bytes - RAND_STRING_SIZE..n_bytes_read].to_vec()
+        } else {
+            let mut cleared_message = uncleared_message[n_bytes - RAND_STRING_SIZE..].to_vec();
+            cleared_message.extend_from_slice(&buf[..n_bytes_read]);
+            cleared_message
+        };
+        cleared_message
+    } else {
+        // implicit n_bytes_read + uncleared_message <= RAND_STRING_SIZE; TODO Might not be right
+        uncleared_message.extend_from_slice(&buf[..n_bytes_read]);
+        Vec::with_capacity(0) // TODO: MAke into an option
+    };
     update_byte_history(byte_history, &buf[..n_bytes_read]);
     let complete = Shell::process_is_complete(end_indication_bytes, byte_history);
     // Probably have to hold the state of the last 16 bytes in case it spans across byte
     // boundaries.
-    let bytes_to_copy = if complete {
-        n_bytes_read - end_indication_bytes.len()
-    } else {
-        n_bytes_read
-    }; // ignore end bytes if possible
     let job = match job {
         JobOut::InMemory(mut v) => {
-            v.extend_from_slice(&buf[..bytes_to_copy]);
+            v.extend_from_slice(&cleared_message);
             JobOut::InMemory(v)
         }
-        JobOut::FileHandle(f, path) => JobOut::FileHandle(f, "".to_owned()),
+        JobOut::FileHandle(f, _path) => JobOut::FileHandle(f, "".to_owned()),
         JobOut::None => {
             if n_bytes_read > 0 && !complete {
-                JobOut::InMemory(buf[..bytes_to_copy].to_vec())
+                JobOut::InMemory(cleared_message)
             } else {
                 JobOut::None
             }
@@ -166,7 +186,7 @@ fn main() {
                                             n_bytes_read,
                                             shell.end_string.as_bytes(),
                                             &mut byte_history,
-                                            &mut uncleared_message
+                                            &mut uncleared_message,
                                         );
                                         if complete {
                                             stdout_sender
@@ -223,7 +243,7 @@ fn main() {
             for _ in 0..n_messages_under {
                 match lines_iter.next() {
                     Some((id, job)) => {
-                        eprintln!("sending job: {}", id);
+                        //eprintln!("sending job: {}", id);
                         job_sender
                             .send(Message::Job((id, job)))
                             .expect("Broker: Unable to send job");
@@ -239,8 +259,8 @@ fn main() {
         }
         // before calling waiting room function
         if i == next_customer {
-            eprintln!("looping");
             loop {
+            eprintln!("looping");
                 // portable function part
                 // increment next_customer and write to stdout
                 match job_output {
@@ -282,6 +302,7 @@ fn main() {
                 }
             }
         } else {
+            eprintln!("Need job {}", next_customer);
             waiting_room.push((i, (job_output, job_err)));
         }
     }
