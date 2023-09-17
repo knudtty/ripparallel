@@ -18,6 +18,7 @@ bench = false
 clap = { version = "4.4.2", features = ["derive"] }
 crossbeam = "0.8.2"
 crossbeam-channel = "0.5.8"
+exitcode = "1.1.2"
 rand = "0.8.5"
 subprocess = "0.2.9"
 tempfile = "3.8.0"
@@ -28,3 +29,6 @@ criterion = { version = "0.4", features = ["html_reports"] }
 [[bench]]
 name = "spawning_strategies"
 harness = false
+
+[profile.release]
+debug = true

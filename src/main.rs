@@ -1,8 +1,12 @@
 use clap::Parser;
 use crossbeam_channel::unbounded;
-use ripparallel::shell::{EndBytes, Shell, RAND_STRING_SIZE};
-use ripparallel::thread_pool;
-use std::fs::File;
+use exitcode;
+use ripparallel::{
+    jobs::{JobOut, Message},
+    ordering::WaitingRoom,
+    shell::{EndBytes, Shell, RAND_STRING_SIZE},
+    thread_pool,
+};
 use std::io::{self, Read, Seek, Write};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
@@ -13,36 +17,35 @@ const CACHE_SIZE: usize = 2048; // 2 kb
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None, trailing_var_arg = true)]
 struct Args {
+    /// Print commands that would be run
+    #[arg(short = 'n', long)]
+    dry_run: bool, // TODO
+
     /// Number of jobs
     #[arg(short, long)]
     jobs: Option<usize>,
 
     /// Placeholder
     #[arg(short = 'I')]
-    replace_string: Option<String>,
+    replace_string: Option<String>, // TODO
+
+    /// Remove memory usage limit. Useful to increase speed when stdout is large
+    #[arg(short = 'M', long)]
+    max_memory: bool, // TODO
+
+    /// value 1-10 to indicate how much memory is available for use. 10 is equivalent to passing -M
+    #[arg(short, long)]
+    memory: Option<u8>, // TODO
 
     /// Maintain order that inputs came in
     #[arg(short, long)]
-    order: Option<bool>,
+    keep_order: bool,
 
     /// job to run
     job: Vec<String>,
 }
 
-enum Message {
-    Job((usize, String)),
-    Quit,
-}
-
-#[derive(Debug)]
-enum JobOut {
-    #[allow(dead_code)]
-    File(File),
-    Memory(Vec<u8>),
-    None,
-}
-
-fn parse_command(command_args: Arc<Vec<String>>, job_input: String) -> String {
+fn parse_command(command_args: &Vec<String>, job_input: String) -> String {
     let cmd_args_len = command_args.len();
     let cmditer = command_args.iter().enumerate();
     let mut command = String::new();
@@ -188,120 +191,183 @@ fn handle_stderr_reads(job: JobOut, buf: &Vec<u8>, n_bytes_read: usize) -> JobOu
     return job;
 }
 
+fn print_outputs(outputs: (JobOut, JobOut)) {
+    // portable function part
+    // increment next_customer and write to stdout
+    let (job_output, job_err) = outputs;
+    let mut stdout = std::io::stdout();
+    let mut stderr = std::io::stderr();
+    match job_output {
+        JobOut::File(mut f) => {
+            f.seek(io::SeekFrom::Start(0))
+                .expect("Failed to return to start");
+            io::copy(&mut f, &mut stdout).expect("Failed to write file to stdout");
+            drop(f); // signals to the OS to remove the tempfile
+        }
+        JobOut::Memory(v) => {
+            stdout
+                .write_all(v.as_slice())
+                .expect("Failed to write to stdout");
+        }
+        JobOut::None => { /* do nothing */ }
+    }
+    match job_err {
+        JobOut::File(mut f) => {
+            eprintln!("At memory...");
+            io::copy(&mut f, &mut stderr).expect("Failed to write file to stdout");
+            drop(f);
+        }
+        JobOut::Memory(v) => {
+            stderr
+                .write_all(v.as_slice())
+                .expect("Failed to write to stdout");
+        }
+        JobOut::None => { /* do nothing */ }
+    }
+}
+
+struct JobExecutor {
+    job_args: Arc<Args>,
+    sender: crossbeam_channel::Sender<(usize, JobOut, JobOut)>,
+    shell: Shell,
+}
+
+impl JobExecutor {
+    fn new(
+        job_args: Arc<Args>,
+        sender: crossbeam_channel::Sender<(usize, JobOut, JobOut)>,
+    ) -> Self {
+        let shell = Shell::new();
+        JobExecutor {
+            job_args,
+            sender,
+            shell,
+        }
+    }
+
+    fn execute_job(&mut self, job: Message) -> bool {
+        match job {
+            Message::Job((i, job_input)) => {
+                let command = parse_command(&self.job_args.job, job_input);
+                if self.job_args.dry_run {
+                    let mut command = command.clone();
+                    command.push('\n');
+                    self.sender
+                        .send((i, JobOut::Memory(command.as_bytes().to_vec()), JobOut::None))
+                        .expect("Failed to send job to main thread");
+                    return false;
+                }
+                self.shell.feed(command);
+                //let mut stderr: Vec<u8> = Vec::new();
+                // figure out streaming stdout and stderr back
+                let mut buf_size = 50; // starting bufsize
+                let mut stdout = JobOut::None;
+                let mut stderr = JobOut::None;
+                let mut complete: bool;
+                let mut byte_history: [u8; RAND_STRING_SIZE] = [0; RAND_STRING_SIZE];
+                let mut uncleared_message = Vec::new();
+                let mut cached_message = Vec::new();
+                loop {
+                    let mut buf = vec![0; buf_size]; // I have found no performance
+                                                     // loss using a vec over a stack
+                                                     // allocated array. Also I can do
+                                                     // dynamic growth now.
+                    if let Ok(n_bytes_read) = self.shell.stdout.read(&mut buf) {
+                        (stdout, complete) = handle_reads(
+                            stdout,
+                            &buf,
+                            n_bytes_read,
+                            self.shell.end_string.as_bytes(),
+                            &mut byte_history,
+                            &mut uncleared_message,
+                            &mut cached_message,
+                        );
+                        if complete {
+                            // theoretically stderr should only pop up when a command
+                            // fails
+                            let mut err_end: bool;
+                            let mut buf = vec![0; buf_size]; // I have found no performance
+                            loop {
+                                // TODO: Have 2 different signals from the shell. One
+                                // if there was an error, and one if there wasn't
+                                if let Ok(n_bytes_read) = self.shell.stderr.read(&mut buf) {
+                                    if n_bytes_read > 0 {
+                                        stderr = handle_stderr_reads(stderr, &buf, n_bytes_read);
+                                        (stderr, err_end) = match stderr {
+                                            JobOut::Memory(mut v) => {
+                                                if Shell::process_is_complete(
+                                                    self.shell.end_string.as_bytes(),
+                                                    &v[v.len() - self.shell.end_string.len()..],
+                                                ) {
+                                                    if v.len() == self.shell.end_string.len() {
+                                                        (JobOut::None, true)
+                                                    } else {
+                                                        v.truncate(
+                                                            v.len() - self.shell.end_string.len(),
+                                                        );
+                                                        (JobOut::Memory(v), true)
+                                                    }
+                                                } else {
+                                                    (JobOut::Memory(v), false)
+                                                }
+                                            }
+                                            JobOut::None => (JobOut::None, false),
+                                            _ => {
+                                                panic!("Stderr should never be a file")
+                                            }
+                                        };
+                                        if err_end {
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        if buf_size == n_bytes_read {
+                            buf_size = (buf_size * 14 / 10).min(2048);
+                        }
+                    } else {
+                        return false;
+                    }
+                    if complete {
+                        self.sender
+                            .send((i, stdout, stderr))
+                            .expect("Failed to send job to main thread");
+                        return false;
+                    }
+                }
+            }
+            Message::Quit => {
+                self.shell.kill();
+                return true;
+            }
+        }
+    }
+}
+
 fn main() {
-    let args = Args::parse();
+    let args = Arc::new(Args::parse());
+    if args.job.is_empty() {
+        eprintln!("rp: Must provide command to execute");
+        std::process::exit(exitcode::USAGE);
+    }
     let input = io::stdin();
 
     let jobs = args.jobs.unwrap_or(thread_pool::max_par() - 1);
-    let command = Arc::new(args.job);
 
     let channel_size = jobs;
-    let (job_sender, job_receiver) = unbounded();
+    let (job_sender, job_receiver) = unbounded::<Message>();
     let (stdout_sender, stdout_receiver) = unbounded();
 
     let handles: Vec<JoinHandle<Result<(), ()>>> = (0..jobs)
         .map(|_| {
-            let stdout_sender = stdout_sender.clone();
-            let command_args = Arc::clone(&command);
+            let mut job_executor = JobExecutor::new(args.clone(), stdout_sender.clone());
             let job_receiver = job_receiver.clone();
             return thread::spawn(move || -> Result<(), ()> {
-                let mut shell = Shell::new();
-                // single receiver shared between all threads
                 for job in job_receiver {
-                    match job {
-                        Message::Job((i, job_input)) => {
-                            let command_args = command_args.clone();
-                            let command = parse_command(command_args, job_input);
-                            shell.feed(command);
-                            //let mut stderr: Vec<u8> = Vec::new();
-                            // figure out streaming stdout and stderr back
-                            let mut buf_size = 50; // starting bufsize
-                            let mut stdout = JobOut::None;
-                            let mut stderr = JobOut::None;
-                            let mut complete: bool;
-                            let mut byte_history: [u8; RAND_STRING_SIZE] = [0; RAND_STRING_SIZE];
-                            let mut uncleared_message = Vec::new();
-                            let mut cached_message = Vec::new();
-                            loop {
-                                let mut buf = vec![0; buf_size]; // I have found no performance
-                                                                 // loss using a vec over a stack
-                                                                 // allocated array. Also I can do
-                                                                 // dynamic growth now.
-                                if let Ok(n_bytes_read) = shell.stdout.read(&mut buf) {
-                                    (stdout, complete) = handle_reads(
-                                        stdout,
-                                        &buf,
-                                        n_bytes_read,
-                                        shell.end_string.as_bytes(),
-                                        &mut byte_history,
-                                        &mut uncleared_message,
-                                        &mut cached_message,
-                                    );
-                                    if complete {
-                                        // theoretically stderr should only pop up when a command
-                                        // fails
-                                        let mut err_end: bool;
-                                        loop {
-                                            if let Ok(n_bytes_read) = shell.stderr.read(&mut buf) {
-                                                if n_bytes_read > 0 {
-                                                    stderr = handle_stderr_reads(
-                                                        stderr,
-                                                        &buf,
-                                                        n_bytes_read,
-                                                    );
-                                                    (stderr, err_end) = match stderr {
-                                                        JobOut::Memory(mut v) => {
-                                                            if Shell::process_is_complete(
-                                                                shell.end_string.as_bytes(),
-                                                                &v[v.len()
-                                                                    - shell.end_string.len()..],
-                                                            ) {
-                                                                if v.len() == shell.end_string.len()
-                                                                {
-                                                                    (JobOut::None, true)
-                                                                } else {
-                                                                    v.truncate(
-                                                                        v.len()
-                                                                            - shell
-                                                                                .end_string
-                                                                                .len(),
-                                                                    );
-                                                                    (JobOut::Memory(v), true)
-                                                                }
-                                                            } else {
-                                                                (JobOut::Memory(v), false)
-                                                            }
-                                                        }
-                                                        JobOut::None => (JobOut::None, false),
-                                                        _ => {
-                                                            panic!("Stderr should never be a file")
-                                                        }
-                                                    };
-                                                    if err_end {
-                                                        break;
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                    if buf_size == n_bytes_read {
-                                        buf_size = (buf_size * 14 / 10).min(2048);
-                                    }
-                                } else {
-                                    break;
-                                }
-                                if complete {
-                                    stdout_sender
-                                        .send((i, stdout, stderr))
-                                        .expect("Failed to send job to main thread");
-                                    break;
-                                }
-                            }
-                        }
-                        Message::Quit => {
-                            shell.kill();
-                            break;
-                        }
+                    let complete = job_executor.execute_job(job);
+                    if complete {
+                        break;
                     }
                 }
                 Ok(())
@@ -324,13 +390,8 @@ fn main() {
             .expect("Error sending job to thread");
     }
 
-    // TODO: Make this ordering thing into a function
-    let mut next_customer = 0;
-    let mut waiting_room = Vec::new();
-    let mut stdout = std::io::stdout();
-    let mut stderr = std::io::stderr();
-    for (i, mut job_output, mut job_err) in stdout_receiver {
-        // before calling waiting room function
+    let mut waiting_room = WaitingRoom::new(print_outputs);
+    for (i, job_output, job_err) in stdout_receiver {
         if lines_iter.peek().is_some() {
             let n_messages_under = channel_size - job_sender.len();
             for _ in 0..n_messages_under {
@@ -342,60 +403,16 @@ fn main() {
                     }
                     _ => {}
                 }
-                break;
             }
         } else {
             job_sender
                 .send(Message::Quit)
                 .expect("Unable to send quit message");
         }
-        // before calling waiting room function
-        if i == next_customer {
-            loop {
-                // portable function part
-                // increment next_customer and write to stdout
-                match job_output {
-                    JobOut::File(mut f) => {
-                        f.seek(io::SeekFrom::Start(0))
-                            .expect("Failed to return to start");
-                        io::copy(&mut f, &mut stdout).expect("Failed to write file to stdout");
-                        drop(f); // signals to the OS to remove the tempfile
-                    }
-                    JobOut::Memory(v) => {
-                        stdout
-                            .write_all(v.as_slice())
-                            .expect("Failed to write to stdout");
-                    }
-                    JobOut::None => { /* do nothing */ }
-                }
-                match job_err {
-                    JobOut::File(mut f) => {
-                        io::copy(&mut f, &mut stderr).expect("Failed to write file to stdout");
-                        drop(f);
-                    }
-                    JobOut::Memory(v) => {
-                        stderr
-                            .write_all(v.as_slice())
-                            .expect("Failed to write to stdout");
-                    }
-                    JobOut::None => { /* do nothing */ }
-                }
-                // portable function part
-                next_customer += 1;
-                // check for next customer in waiting_room
-                if let Some(idx) = waiting_room
-                    .iter()
-                    .position(|(customer, _)| customer == &next_customer)
-                {
-                    // if found, copy entry to new_customer, copy last entry into indexed spot and pop last entry.
-                    (job_output, job_err) = waiting_room.swap_remove(idx).1;
-                } else {
-                    // else break loop
-                    break;
-                }
-            }
+        if args.keep_order {
+            waiting_room.serve_customer(i, (job_output, job_err));
         } else {
-            waiting_room.push((i, (job_output, job_err)));
+            print_outputs((job_output, job_err));
         }
     }
 
