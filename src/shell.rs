@@ -1,4 +1,5 @@
 use rand::distributions::{Alphanumeric, DistString};
+use std::env;
 use std::io::Write;
 use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, Stdio};
 
@@ -32,8 +33,9 @@ impl Shell {
 
     fn birth(shell_name: Option<&str>) -> Self {
         // Spawn a new shell process
-        let child_end_string = Alphanumeric.sample_string(&mut rand::thread_rng(), RAND_STRING_SIZE);
-        let mut child = Command::new(shell_name.unwrap_or("dash"))
+        let child_end_string =
+            Alphanumeric.sample_string(&mut rand::thread_rng(), RAND_STRING_SIZE);
+        let mut child = Command::new(shell_name.unwrap_or(env::var("SHELL").unwrap_or("bash".to_string()).as_str()))
             .arg("-c")
             .arg(format!("while true; do read line; if [ \"$line\" = \"exit\" ]; then exit; fi; $line; printf {}; printf {} >&2; done", child_end_string, child_end_string))
             .stdout(Stdio::piped())
@@ -67,16 +69,15 @@ impl Shell {
         let bytes_len = end_bytes.len();
         let stdout_len = stdout.len();
         if stdout_len < bytes_len {
-            return false
+            return false;
         }
         for (bytes_i, stdout_i) in ((stdout_len - bytes_len)..stdout_len).enumerate() {
             let stdout_byte = stdout.get(stdout_i).unwrap();
             let bytes_byte = end_bytes.get(bytes_i).unwrap();
             if stdout_byte != bytes_byte {
-                return false
+                return false;
             }
         }
-        return true
-
+        return true;
     }
 }

@@ -8,6 +8,8 @@ struct SuperSpecialReader {
     byte_history: [u8; RAND_STRING_SIZE],
     uncleared_message: Vec<u8>,
     cached_message: Vec<u8>,
+}
 
+impl SuperSpecialReader {
     //fn update_job();
 }
