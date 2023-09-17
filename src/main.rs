@@ -19,7 +19,7 @@ const CACHE_SIZE: usize = 2048; // 2 kb
 struct Args {
     /// Print commands that would be run
     #[arg(short = 'n', long)]
-    dry_run: bool, // TODO
+    dryrun: bool,
 
     /// Number of jobs
     #[arg(short, long)]
