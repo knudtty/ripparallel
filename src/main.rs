@@ -70,6 +70,7 @@ fn parse_command(command_args: &Vec<String>, job_input: String) -> String {
     if !substituted {
         command.push_str(job_input.as_str());
     }
+    command.push('\n');
     command
 }
 
@@ -249,7 +250,7 @@ impl JobExecutor {
         match job {
             Message::Job((i, job_input)) => {
                 let command = parse_command(&self.job_args.job, job_input);
-                if self.job_args.dry_run {
+                if self.job_args.dryrun {
                     let mut command = command.clone();
                     command.push('\n');
                     self.sender
