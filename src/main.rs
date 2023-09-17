@@ -3,7 +3,7 @@ use crossbeam_channel::unbounded;
 use ripparallel::shell::{EndBytes, Shell, RAND_STRING_SIZE};
 use ripparallel::thread_pool;
 use std::fs::File;
-use std::io::{self, Read, Write, Seek};
+use std::io::{self, Read, Seek, Write};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 
@@ -91,7 +91,7 @@ fn handle_reads(
     end_indication_bytes: &[u8],
     byte_history: &mut [u8; RAND_STRING_SIZE],
     uncleared_message: &mut Vec<u8>,
-    cached_message: &mut Vec<u8>
+    cached_message: &mut Vec<u8>,
 ) -> (JobOut, bool) {
     let cleared_message = if n_bytes_read >= RAND_STRING_SIZE {
         let last_message_bytes = n_bytes_read - RAND_STRING_SIZE;
@@ -146,13 +146,14 @@ fn handle_reads(
             if let Some(cleared) = cleared_message {
                 if complete || cleared.len() + cached_message.len() > CACHE_SIZE {
                     //println!("writing: {:?}", cleared);
-                    f.write_all(&cached_message).expect("Failed to write to file");
+                    f.write_all(&cached_message)
+                        .expect("Failed to write to file");
                     f.write_all(&cleared).expect("Failed to write to file");
                     *cached_message = vec![];
                 } else {
                     cached_message.extend_from_slice(&cleared);
                 }
-            } 
+            }
             JobOut::File(f)
         }
         JobOut::None => {
@@ -165,6 +166,27 @@ fn handle_reads(
     };
     return (job, complete);
 }
+fn handle_stderr_reads(job: JobOut, buf: &Vec<u8>, n_bytes_read: usize) -> JobOut {
+    // Probably have to hold the state of the last 16 bytes in case it spans across byte
+    // boundaries.
+    let job = match job {
+        JobOut::Memory(mut v) => {
+            v.extend_from_slice(&buf[..n_bytes_read]);
+            JobOut::Memory(v)
+        }
+        JobOut::None => {
+            if n_bytes_read > 0 {
+                JobOut::Memory(buf[..n_bytes_read].to_vec())
+            } else {
+                JobOut::None
+            }
+        }
+        _ => {
+            panic!("Stderr is being written to a file, this shouldn't be possible")
+        }
+    };
+    return job;
+}
 
 fn main() {
     let args = Args::parse();
@@ -173,7 +195,7 @@ fn main() {
     let jobs = args.jobs.unwrap_or(thread_pool::max_par() - 1);
     let command = Arc::new(args.job);
 
-    let channel_size = jobs * 3;
+    let channel_size = jobs;
     let (job_sender, job_receiver) = unbounded();
     let (stdout_sender, stdout_receiver) = unbounded();
 
@@ -195,7 +217,7 @@ fn main() {
                             // figure out streaming stdout and stderr back
                             let mut buf_size = 50; // starting bufsize
                             let mut stdout = JobOut::None;
-                            //let mut stderr = JobOut::None;
+                            let mut stderr = JobOut::None;
                             let mut complete: bool;
                             let mut byte_history: [u8; RAND_STRING_SIZE] = [0; RAND_STRING_SIZE];
                             let mut uncleared_message = Vec::new();
@@ -205,33 +227,74 @@ fn main() {
                                                                  // loss using a vec over a stack
                                                                  // allocated array. Also I can do
                                                                  // dynamic growth now.
-                                match shell.stdout.read(&mut buf) {
-                                    Ok(0) => {
-                                        eprintln!("Stuck reading 0");
-                                    }
-                                    Ok(n_bytes_read) => {
-                                        (stdout, complete) = handle_reads(
-                                            stdout,
-                                            &buf,
-                                            n_bytes_read,
-                                            shell.end_string.as_bytes(),
-                                            &mut byte_history,
-                                            &mut uncleared_message,
-                                            &mut cached_message
-                                        );
-                                        if complete {
-                                            stdout_sender
-                                                .send((i, stdout, JobOut::None))
-                                                .expect("Failed to send job to main thread");
-                                            break;
+                                if let Ok(n_bytes_read) = shell.stdout.read(&mut buf) {
+                                    (stdout, complete) = handle_reads(
+                                        stdout,
+                                        &buf,
+                                        n_bytes_read,
+                                        shell.end_string.as_bytes(),
+                                        &mut byte_history,
+                                        &mut uncleared_message,
+                                        &mut cached_message,
+                                    );
+                                    if complete {
+                                        // theoretically stderr should only pop up when a command
+                                        // fails
+                                        let mut err_end: bool;
+                                        loop {
+                                            if let Ok(n_bytes_read) = shell.stderr.read(&mut buf) {
+                                                if n_bytes_read > 0 {
+                                                    stderr = handle_stderr_reads(
+                                                        stderr,
+                                                        &buf,
+                                                        n_bytes_read,
+                                                    );
+                                                    (stderr, err_end) = match stderr {
+                                                        JobOut::Memory(mut v) => {
+                                                            if Shell::process_is_complete(
+                                                                shell.end_string.as_bytes(),
+                                                                &v[v.len()
+                                                                    - shell.end_string.len()..],
+                                                            ) {
+                                                                if v.len() == shell.end_string.len()
+                                                                {
+                                                                    (JobOut::None, true)
+                                                                } else {
+                                                                    v.truncate(
+                                                                        v.len()
+                                                                            - shell
+                                                                                .end_string
+                                                                                .len(),
+                                                                    );
+                                                                    (JobOut::Memory(v), true)
+                                                                }
+                                                            } else {
+                                                                (JobOut::Memory(v), false)
+                                                            }
+                                                        }
+                                                        JobOut::None => (JobOut::None, false),
+                                                        _ => {
+                                                            panic!("Stderr should never be a file")
+                                                        }
+                                                    };
+                                                    if err_end {
+                                                        break;
+                                                    }
+                                                }
+                                            }
                                         }
-                                        if buf_size == n_bytes_read {
-                                            buf_size = (buf_size * 14 / 10).min(2048);
-                                        }
                                     }
-                                    Err(_) => {
-                                        eprintln!("ERROR");
+                                    if buf_size == n_bytes_read {
+                                        buf_size = (buf_size * 14 / 10).min(2048);
                                     }
+                                } else {
+                                    break;
+                                }
+                                if complete {
+                                    stdout_sender
+                                        .send((i, stdout, stderr))
+                                        .expect("Failed to send job to main thread");
+                                    break;
                                 }
                             }
                         }
@@ -293,7 +356,8 @@ fn main() {
                 // increment next_customer and write to stdout
                 match job_output {
                     JobOut::File(mut f) => {
-                        f.seek(io::SeekFrom::Start(0)).expect("Failed to return to start");
+                        f.seek(io::SeekFrom::Start(0))
+                            .expect("Failed to return to start");
                         io::copy(&mut f, &mut stdout).expect("Failed to write file to stdout");
                         drop(f); // signals to the OS to remove the tempfile
                     }
@@ -302,8 +366,7 @@ fn main() {
                             .write_all(v.as_slice())
                             .expect("Failed to write to stdout");
                     }
-                    JobOut::None => { 
-                        /* do nothing */ }
+                    JobOut::None => { /* do nothing */ }
                 }
                 match job_err {
                     JobOut::File(mut f) => {

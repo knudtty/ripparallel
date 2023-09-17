@@ -35,7 +35,7 @@ impl Shell {
         let child_end_string = Alphanumeric.sample_string(&mut rand::thread_rng(), RAND_STRING_SIZE);
         let mut child = Command::new(shell_name.unwrap_or("dash"))
             .arg("-c")
-            .arg(format!("while true; do read line; if [ \"$line\" = \"exit\" ]; then exit; fi; $line; printf {}; done", child_end_string))
+            .arg(format!("while true; do read line; if [ \"$line\" = \"exit\" ]; then exit; fi; $line; printf {}; printf {} >&2; done", child_end_string, child_end_string))
             .stdout(Stdio::piped())
             .stdin(Stdio::piped())
             .stderr(Stdio::piped())
