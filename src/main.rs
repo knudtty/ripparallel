@@ -41,11 +41,19 @@ struct Args {
     #[arg(short, long)]
     keep_order: bool,
 
+    /// Surround argument with single quotes
+    #[arg(short, long)]
+    quotes: bool,
+
+    /// Shell to run in. If not specified, $SHELL is used
+    #[arg(long)]
+    shell: Option<String>,
+
     /// job to run
     job: Vec<String>,
 }
 
-fn parse_command(command_args: &Vec<String>, job_input: String) -> String {
+fn parse_command(command_args: &Vec<String>, job_input: String, quotes: bool) -> String {
     let cmd_args_len = command_args.len();
     let cmditer = command_args.iter().enumerate();
     let mut command = String::new();
@@ -53,7 +61,13 @@ fn parse_command(command_args: &Vec<String>, job_input: String) -> String {
     cmditer.for_each(|(i, arg)| {
         if arg.as_str() == "{}" {
             substituted = true;
-            command.push_str(job_input.as_str());
+            if quotes {
+                command.push('\'');
+                command.push_str(job_input.as_str());
+                command.push('\'');
+            } else {
+                command.push_str(job_input.as_str());
+            }
             command.push(' ');
         } else {
             command.push_str(arg.as_str());
@@ -68,7 +82,13 @@ fn parse_command(command_args: &Vec<String>, job_input: String) -> String {
         }
     });
     if !substituted {
-        command.push_str(job_input.as_str());
+        if quotes {
+            command.push('\'');
+            command.push_str(job_input.as_str());
+            command.push('\'');
+        } else {
+            command.push_str(job_input.as_str());
+        }
     }
     command.push('\n');
     command
@@ -249,7 +269,7 @@ impl JobExecutor {
     fn execute_job(&mut self, job: Message) -> bool {
         match job {
             Message::Job((i, job_input)) => {
-                let command = parse_command(&self.job_args.job, job_input);
+                let command = parse_command(&self.job_args.job, job_input, self.job_args.quotes);
                 if self.job_args.dryrun {
                     let mut command = command.clone();
                     command.push('\n');

@@ -29,6 +29,3 @@ criterion = { version = "0.4", features = ["html_reports"] }
 [[bench]]
 name = "spawning_strategies"
 harness = false
-
-[profile.release]
-debug = true
