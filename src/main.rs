@@ -271,8 +271,7 @@ impl JobExecutor {
             Message::Job((i, job_input)) => {
                 let command = parse_command(&self.job_args.job, job_input, self.job_args.quotes);
                 if self.job_args.dryrun {
-                    let mut command = command.clone();
-                    command.push('\n');
+                    let command = command.clone();
                     self.sender
                         .send((i, JobOut::Memory(command.as_bytes().to_vec()), JobOut::None))
                         .expect("Failed to send job to main thread");
