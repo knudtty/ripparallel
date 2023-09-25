@@ -11,7 +11,7 @@ use std::io::{self, Read, Seek, Write};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 
-const MAX_MEMORY_SIZE: usize = 1048; // 2 kb
+const MAX_MEMORY_SIZE: usize = 8192; // 8 kb
 const CACHE_SIZE: usize = 2048; // 2 kb
 
 #[derive(Parser, Debug)]
@@ -154,9 +154,6 @@ fn handle_reads(
                     let mut f = tempfile::tempfile().expect("Failed to create tempfile");
                     f.write_all(&v).expect("Failed to write to file");
                     f.write_all(&cleared).expect("Failed to write to file");
-                    //let mut buf = String::new();
-                    //f.read_to_string(&mut buf);
-                    //println!("{}", buf);
                     JobOut::File(f)
                 } else {
                     v.extend_from_slice(&cleared);
@@ -169,7 +166,6 @@ fn handle_reads(
         JobOut::File(mut f) => {
             if let Some(cleared) = cleared_message {
                 if complete || cleared.len() + cached_message.len() > CACHE_SIZE {
-                    //println!("writing: {:?}", cleared);
                     f.write_all(&cached_message)
                         .expect("Failed to write to file");
                     f.write_all(&cleared).expect("Failed to write to file");
@@ -269,6 +265,7 @@ impl JobExecutor {
     fn execute_job(&mut self, job: Message) -> bool {
         match job {
             Message::Job((i, job_input)) => {
+                println!("{:?}", self.job_args.job);
                 let command = parse_command(&self.job_args.job, job_input, self.job_args.quotes);
                 if self.job_args.dryrun {
                     let command = command.clone();
@@ -375,40 +372,44 @@ fn main() {
 
     let jobs = args.jobs.unwrap_or(thread_pool::max_par() - 1);
 
-    let channel_size = jobs;
     let (job_sender, job_receiver) = unbounded::<Message>();
     let (stdout_sender, stdout_receiver) = unbounded();
 
-    let handles: Vec<JoinHandle<Result<(), ()>>> = (0..jobs)
-        .map(|_| {
-            let mut job_executor = JobExecutor::new(args.clone(), stdout_sender.clone());
-            let job_receiver = job_receiver.clone();
-            return thread::spawn(move || -> Result<(), ()> {
-                for job in job_receiver {
-                    let complete = job_executor.execute_job(job);
-                    if complete {
-                        break;
-                    }
-                }
-                Ok(())
-            });
-        })
-        .collect();
-
     // all steps necessary in order to preparing to start
-    drop(stdout_sender);
     let mut lines_iter = input
         .lines()
         .map(|res| res.expect("Error reading line from stdin"))
         .enumerate()
         .peekable();
     // fill jobs initially
-    for _ in 0..channel_size {
-        let (i, line_res) = lines_iter.next().unwrap();
-        job_sender
-            .send(Message::Job((i, line_res)))
-            .expect("Error sending job to thread");
+    let mut handles = Vec::new();
+    for _ in 0..jobs {
+        match lines_iter.next() {
+            Some(line) => {
+                let stdout_sender = stdout_sender.clone();
+                let job_receiver = job_receiver.clone();
+                let args = args.clone();
+                handles.push(thread::spawn(move || -> Result<(), ()> {
+                    let mut job_executor = JobExecutor::new(args, stdout_sender);
+                    let mut job = Message::Job(line);
+                    loop {
+                        let complete = job_executor.execute_job(job);
+                        if complete {
+                            break;
+                        };
+                        match job_receiver.recv() {
+                            Ok(res) => job = res,
+                            Err(_) => break
+                        }
+                    }
+                    Ok(())
+                }));
+            }
+            None => break,
+        }
     }
+    let channel_size = handles.len();
+    drop(stdout_sender);
 
     let mut waiting_room = WaitingRoom::new(print_outputs);
     for (i, job_output, job_err) in stdout_receiver {
@@ -435,6 +436,7 @@ fn main() {
             print_outputs((job_output, job_err));
         }
     }
+
 
     // Send lines to the channel from the main thread
     for handle in handles {
