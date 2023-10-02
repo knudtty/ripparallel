@@ -60,6 +60,8 @@ impl Shell {
         self.stdin
             .write_all(command.as_bytes())
             .expect("Failed to write to stdin");
+        self.stdin.write_all(b"\n")
+            .expect("Failed to write to stdin");
     }
 
     pub fn process_is_complete(end_bytes: &[u8], stdout: &[u8]) -> bool {

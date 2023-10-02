@@ -6,10 +6,11 @@ use ripparallel::{
     ordering::WaitingRoom,
     shell::{EndBytes, Shell, RAND_STRING_SIZE},
     thread_pool,
+    tokenize::Token,
 };
 use std::io::{self, Read, Seek, Write};
 use std::sync::Arc;
-use std::thread::{self, JoinHandle};
+use std::thread;
 
 const MAX_MEMORY_SIZE: usize = 8192; // 8 kb
 const CACHE_SIZE: usize = 2048; // 2 kb
@@ -53,45 +54,96 @@ struct Args {
     job: Vec<String>,
 }
 
-fn parse_command(command_args: &Vec<String>, job_input: String, quotes: bool) -> String {
-    let cmd_args_len = command_args.len();
-    let cmditer = command_args.iter().enumerate();
-    let mut command = String::new();
-    let mut substituted = false;
-    cmditer.for_each(|(i, arg)| {
-        if arg.as_str() == "{}" {
-            substituted = true;
-            if quotes {
-                command.push('\'');
-                command.push_str(job_input.as_str());
-                command.push('\'');
-            } else {
-                command.push_str(job_input.as_str());
+struct MyStringIterator<'a> {
+    inner: Box<dyn Iterator<Item = String> + 'a>,
+}
+
+impl<'a> MyStringIterator<'a> {
+    // Create an iterator from a whitespace-separated string
+    fn from_str(input: &'a str) -> Self {
+        let inner = Box::new(CustomSplit::new(input));
+        MyStringIterator { inner }
+    }
+
+    // Create an iterator from a Vec<String>
+    fn from_vec(vec: Vec<String>) -> Self {
+        let inner = Box::new(vec.into_iter());
+        MyStringIterator { inner }
+    }
+}
+
+impl<'a> Iterator for MyStringIterator<'a> {
+    type Item = String;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let out = self.inner.next();
+        match out {
+            Some(mut v) => {
+                v.push(' ');
+                Some(v)
             }
-            command.push(' ');
-        } else {
-            command.push_str(arg.as_str());
-            // not end of command, should push a space
-            if i != cmd_args_len - 1 {
-                command.push(' ');
-            // end of command, should push a space if substitution is
-            // expected to take place at end
-            } else if !substituted {
-                command.push(' ');
+            None => {
+                out
             }
-        }
-    });
-    if !substituted {
-        if quotes {
-            command.push('\'');
-            command.push_str(job_input.as_str());
-            command.push('\'');
-        } else {
-            command.push_str(job_input.as_str());
         }
     }
-    command.push('\n');
-    command
+}
+
+#[derive(Debug)]
+struct CustomSplit<'a> {
+    input: &'a str,
+    end: usize,
+}
+
+impl<'a> CustomSplit<'a> {
+    fn new(input: &'a str) -> Self {
+        CustomSplit {
+            input,
+            end: 0,
+        }
+    }
+}
+
+impl<'a> Iterator for CustomSplit<'a> {
+    type Item = String;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let mut out = None;
+        if self.end < self.input.len() {
+            out = Some(self.input.get(self.end..self.end+1).unwrap().to_owned());
+            self.end += 1;
+        }
+        return out;
+    }
+}
+
+fn pre_parse_command(command_args: &Vec<String>, quotes: bool) -> Vec<Token> {
+    let cmditer = if command_args.len() == 1 {
+        MyStringIterator::from_str(&command_args[0])
+    } else {
+        MyStringIterator::from_vec(command_args.clone())
+    };
+    let tokens = Token::get_tokens(cmditer.collect(), quotes);
+    tokens
+}
+
+fn parse_command(tokens: &Vec<Token>, job: String) -> String {
+    let mut substituted = false;
+    let mut parsed = tokens.iter().fold(String::new(), |mut out, token| {
+        out.push_str(match token {
+            Token::Literal(s) => &s,
+            Token::Substitute => {
+                substituted = true;
+                &job
+            },
+        });
+        out
+    });
+    if !substituted {
+        parsed.push(' ');
+        parsed.push_str(job.as_str());
+    }
+    parsed 
 }
 
 fn update_byte_history(byte_history: &mut EndBytes, buf: &[u8]) {
@@ -245,6 +297,7 @@ fn print_outputs(outputs: (JobOut, JobOut)) {
 
 struct JobExecutor {
     job_args: Arc<Args>,
+    job_tokens: Arc<Vec<Token>>,
     sender: crossbeam_channel::Sender<(usize, JobOut, JobOut)>,
     shell: Shell,
 }
@@ -252,11 +305,13 @@ struct JobExecutor {
 impl JobExecutor {
     fn new(
         job_args: Arc<Args>,
+        job_tokens: Arc<Vec<Token>>,
         sender: crossbeam_channel::Sender<(usize, JobOut, JobOut)>,
     ) -> Self {
         let shell = Shell::new();
         JobExecutor {
             job_args,
+            job_tokens,
             sender,
             shell,
         }
@@ -265,8 +320,7 @@ impl JobExecutor {
     fn execute_job(&mut self, job: Message) -> bool {
         match job {
             Message::Job((i, job_input)) => {
-                println!("{:?}", self.job_args.job);
-                let command = parse_command(&self.job_args.job, job_input, self.job_args.quotes);
+                let command = parse_command(&self.job_tokens, job_input);
                 if self.job_args.dryrun {
                     let command = command.clone();
                     self.sender
@@ -368,6 +422,7 @@ fn main() {
         eprintln!("rp: Must provide command to execute");
         std::process::exit(exitcode::USAGE);
     }
+    let job = Arc::new(pre_parse_command(&args.job, args.quotes));
     let input = io::stdin();
 
     let jobs = args.jobs.unwrap_or(thread_pool::max_par() - 1);
@@ -388,9 +443,10 @@ fn main() {
             Some(line) => {
                 let stdout_sender = stdout_sender.clone();
                 let job_receiver = job_receiver.clone();
+                let job = job.clone();
                 let args = args.clone();
                 handles.push(thread::spawn(move || -> Result<(), ()> {
-                    let mut job_executor = JobExecutor::new(args, stdout_sender);
+                    let mut job_executor = JobExecutor::new(args, job, stdout_sender);
                     let mut job = Message::Job(line);
                     loop {
                         let complete = job_executor.execute_job(job);
@@ -399,7 +455,7 @@ fn main() {
                         };
                         match job_receiver.recv() {
                             Ok(res) => job = res,
-                            Err(_) => break
+                            Err(_) => break,
                         }
                     }
                     Ok(())
@@ -436,7 +492,6 @@ fn main() {
             print_outputs((job_output, job_err));
         }
     }
-
 
     // Send lines to the channel from the main thread
     for handle in handles {
