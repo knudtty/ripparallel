@@ -4,11 +4,11 @@ use exitcode;
 use ripparallel::{
     jobs::{JobOut, Message},
     ordering::WaitingRoom,
-    shell::{EndBytes, Shell, RAND_STRING_SIZE},
+    shell::Shell,
     thread_pool,
     tokenize::Token,
 };
-use std::io::{self, Read, Seek, Write};
+use std::io::{self, Seek, Write};
 use std::sync::Arc;
 use std::thread;
 
@@ -108,9 +108,13 @@ impl<'a> Iterator for CommandIterator<'a> {
 }
 
 fn pre_parse_command(command_args: &Vec<String>, quotes: bool) -> Vec<Token> {
+    println!("command args: {:?}", command_args);
     let cmditer = CommandIterator::from_vec(command_args);
     let command: String = cmditer.collect();
+    //println!("command: {:?}", command);
     let mut tokens = Token::get_tokens(command, quotes);
+    // TODO: Fix this case: `seq 1 100 | rp echo {fjkdsal dfjskal {} {}
+    //println!("Tokens: {:?}", tokens);
     if !tokens.iter().any(|token| *token == Token::Substitute) {
         match tokens.last_mut() {
             Some(Token::Literal(literal)) => literal.push(' '),

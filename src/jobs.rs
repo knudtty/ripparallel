@@ -5,6 +5,7 @@ pub enum Message {
     Quit,
 }
 
+#[derive(Debug)]
 pub enum JobOut {
     File(File),
     Memory(Vec<u8>),

@@ -14,10 +14,9 @@ pub type EndBytes = [u8; RAND_STRING_SIZE];
 pub struct Shell {
     slave: Child,
     stdin: ChildStdin,
-    pub stdout: ChildStdout,
-    #[allow(dead_code)]
-    pub stderr: ChildStderr,
-    pub end_string: String,
+    stdout: ChildStdout,
+    stderr: ChildStderr,
+    end_bytes: [u8; RAND_STRING_SIZE],
 }
 
 impl Shell {
@@ -62,12 +61,14 @@ impl Shell {
         let child_stdin = child.stdin.take().expect("Failed to open stdin");
         let child_stdout = child.stdout.take().expect("Failed to open stdout");
         let child_stderr = child.stderr.take().expect("Failed to open stdout");
+        let mut end_bytes: [u8; RAND_STRING_SIZE] = [0; RAND_STRING_SIZE];
+        end_bytes.copy_from_slice(&child_end_string.as_bytes()[0..RAND_STRING_SIZE]);
         Shell {
             slave: child,
             stdin: child_stdin,
             stdout: child_stdout,
             stderr: child_stderr,
-            end_string: child_end_string,
+            end_bytes
         }
     }
 
@@ -81,75 +82,9 @@ impl Shell {
     }
 
     fn read(&mut self) -> (JobOut, JobOut) {
-        let mut buf_size = 50; // starting bufsize
-        let mut stdout = JobOut::None;
-        let mut stderr = JobOut::None;
-        let mut complete: bool;
-        let mut byte_history: [u8; RAND_STRING_SIZE] = [0; RAND_STRING_SIZE];
-        let mut uncleared_message = Vec::new();
-        let mut cached_message = Vec::new();
-        loop {
-            let mut buf = vec![0; buf_size]; // I have found no performance
-                                             // loss using a vec over a stack
-                                             // allocated array. Also I can do
-                                             // dynamic growth now.
-            if let Ok(n_bytes_read) = self.stdout.read(&mut buf) {
-                (stdout, complete) = handle_reads(
-                    stdout,
-                    &buf,
-                    n_bytes_read,
-                    self.end_string.as_bytes(),
-                    &mut byte_history,
-                    &mut uncleared_message,
-                    &mut cached_message,
-                );
-                if complete {
-                    // theoretically stderr should only pop up when a command
-                    // fails
-                    let mut err_end: bool;
-                    let mut buf = vec![0; buf_size]; // I have found no performance
-                    loop {
-                        // TODO: Have 2 different signals from the shell. One
-                        // if there was an error, and one if there wasn't
-                        if let Ok(n_bytes_read) = self.stderr.read(&mut buf) {
-                            if n_bytes_read > 0 {
-                                stderr = handle_stderr_reads(stderr, &buf, n_bytes_read);
-                                (stderr, err_end) = match stderr {
-                                    JobOut::Memory(mut v) => {
-                                        if Shell::process_is_complete(
-                                            self.end_string.as_bytes(),
-                                            &v[v.len() - self.end_string.len()..],
-                                        ) {
-                                            if v.len() == self.end_string.len() {
-                                                (JobOut::None, true)
-                                            } else {
-                                                v.truncate(v.len() - self.end_string.len());
-                                                (JobOut::Memory(v), true)
-                                            }
-                                        } else {
-                                            (JobOut::Memory(v), false)
-                                        }
-                                    }
-                                    JobOut::None => (JobOut::None, false),
-                                    _ => {
-                                        panic!("Stderr should never be a file")
-                                    }
-                                };
-                                if err_end {
-                                    return (stdout, stderr);
-                                }
-                            }
-                        }
-                    }
-                }
-                if buf_size == n_bytes_read {
-                    buf_size = (buf_size * 14 / 10).min(2048);
-                }
-            } else {
-                break;
-            }
-        }
-        return (JobOut::None, JobOut::None);
+        let stdout = ExecutionReader::from(&mut self.stdout, &self.end_bytes);
+        let stderr = ExecutionReader::from(&mut self.stderr, &self.end_bytes);
+        return (stdout, stderr);
     }
 
     pub fn process_is_complete(end_bytes: &[u8], stdout: &[u8]) -> bool {
@@ -169,104 +104,155 @@ impl Shell {
     }
 }
 
-fn handle_reads(
-    job: JobOut,
-    buf: &Vec<u8>,
-    n_bytes_read: usize,
-    end_indication_bytes: &[u8],
-    byte_history: &mut [u8; RAND_STRING_SIZE],
-    uncleared_message: &mut Vec<u8>,
-    cached_message: &mut Vec<u8>,
-) -> (JobOut, bool) {
-    let cleared_message = if n_bytes_read >= RAND_STRING_SIZE {
-        let last_message_bytes = n_bytes_read - RAND_STRING_SIZE;
-        let mut cleared_message = uncleared_message.clone();
-        cleared_message.extend_from_slice(&buf[..last_message_bytes]);
-        *uncleared_message = buf[last_message_bytes..n_bytes_read].to_vec();
-        Some(cleared_message)
-    } else if n_bytes_read + uncleared_message.len() > RAND_STRING_SIZE {
-        let n_bytes = n_bytes_read + uncleared_message.len();
-        let cleared_message = if n_bytes - RAND_STRING_SIZE >= uncleared_message.len() {
-            uncleared_message.to_owned()
-        } else {
-            uncleared_message[..n_bytes - RAND_STRING_SIZE].to_vec()
-        };
-        *uncleared_message = if n_bytes - RAND_STRING_SIZE >= uncleared_message.len() {
-            buf[n_bytes - RAND_STRING_SIZE..n_bytes_read].to_vec()
-        } else {
-            let mut cleared_message = uncleared_message[n_bytes - RAND_STRING_SIZE..].to_vec();
-            cleared_message.extend_from_slice(&buf[..n_bytes_read]);
-            cleared_message
-        };
-        Some(cleared_message)
-    } else {
-        // implicit n_bytes_read + uncleared_message <= RAND_STRING_SIZE; TODO Might not be right
-        uncleared_message.extend_from_slice(&buf[..n_bytes_read]);
-        None
-    };
-    update_byte_history(byte_history, &uncleared_message);
-    let complete = Shell::process_is_complete(end_indication_bytes, byte_history);
-    // Probably have to hold the state of the last 16 bytes in case it spans across byte
-    // boundaries.
-    let job = match job {
-        JobOut::Memory(mut v) => {
-            if let Some(cleared) = cleared_message {
-                if v.len() + cleared.len() > MAX_MEMORY_SIZE {
-                    let mut f = tempfile::tempfile().expect("Failed to create tempfile");
-                    f.write_all(&v).expect("Failed to write to file");
-                    f.write_all(&cleared).expect("Failed to write to file");
-                    JobOut::File(f)
-                } else {
-                    v.extend_from_slice(&cleared);
-                    JobOut::Memory(v)
-                }
-            } else {
-                JobOut::Memory(v)
-            }
-        }
-        JobOut::File(mut f) => {
-            if let Some(cleared) = cleared_message {
-                if complete || cleared.len() + cached_message.len() > CACHE_SIZE {
-                    f.write_all(&cached_message)
-                        .expect("Failed to write to file");
-                    f.write_all(&cleared).expect("Failed to write to file");
-                    *cached_message = vec![];
-                } else {
-                    cached_message.extend_from_slice(&cleared);
-                }
-            }
-            JobOut::File(f)
-        }
-        JobOut::None => {
-            if cleared_message.is_some() {
-                JobOut::Memory(cleared_message.unwrap())
-            } else {
-                JobOut::None
-            }
-        }
-    };
-    return (job, complete);
+struct ExecutionReader {
+    byte_history: [u8; RAND_STRING_SIZE],
+    uncleared_message: Vec<u8>,
+    cached_message: Vec<u8>,
 }
-fn handle_stderr_reads(job: JobOut, buf: &Vec<u8>, n_bytes_read: usize) -> JobOut {
-    // Probably have to hold the state of the last 16 bytes in case it spans across byte
-    // boundaries.
-    let job = match job {
-        JobOut::Memory(mut v) => {
-            v.extend_from_slice(&buf[..n_bytes_read]);
-            JobOut::Memory(v)
+
+impl ExecutionReader {
+    fn new() -> Self {
+        Self {
+            byte_history: [0; RAND_STRING_SIZE],
+            uncleared_message: Vec::new(),
+            cached_message: Vec::new(),
         }
-        JobOut::None => {
-            if n_bytes_read > 0 {
-                JobOut::Memory(buf[..n_bytes_read].to_vec())
+    }
+
+    fn from(source: &mut impl Read, end_indication_bytes: &[u8; RAND_STRING_SIZE]) -> JobOut {
+        let mut reader = ExecutionReader::new();
+        reader.read(source, end_indication_bytes)
+    }
+
+    fn read(&mut self, source: &mut impl Read, end_indication_bytes: &[u8; RAND_STRING_SIZE]) -> JobOut {
+        let mut buf_size = 50;
+        let mut job = JobOut::None;
+        loop {
+            let mut buf = vec![0; buf_size]; // I have found no performance
+                                             // loss using a vec over a stack
+                                             // allocated array. Also I can do
+                                             // dynamic growth now.
+            if let Ok(n_bytes_read) = source.read(&mut buf) {
+                let cleared_message = if n_bytes_read >= RAND_STRING_SIZE {
+                    let last_message_bytes = n_bytes_read - RAND_STRING_SIZE;
+                    let mut cleared_message = self.uncleared_message.clone();
+                    cleared_message.extend_from_slice(&buf[..last_message_bytes]);
+                    self.uncleared_message = buf[last_message_bytes..n_bytes_read].to_vec();
+                    Some(cleared_message)
+                } else if n_bytes_read + self.uncleared_message.len() > RAND_STRING_SIZE {
+                    let n_bytes = n_bytes_read + self.uncleared_message.len();
+                    let cleared_message = if n_bytes - RAND_STRING_SIZE >= self.uncleared_message.len() {
+                        self.uncleared_message.to_owned()
+                    } else {
+                        self.uncleared_message[..n_bytes - RAND_STRING_SIZE].to_vec()
+                    };
+                    self.uncleared_message = if n_bytes - RAND_STRING_SIZE >= self.uncleared_message.len() {
+                        buf[n_bytes - RAND_STRING_SIZE..n_bytes_read].to_vec()
+                    } else {
+                        let mut cleared_message = self.uncleared_message[n_bytes - RAND_STRING_SIZE..].to_vec();
+                        cleared_message.extend_from_slice(&buf[..n_bytes_read]);
+                        cleared_message
+                    };
+                    Some(cleared_message)
+                } else {
+                    // implicit n_bytes_read + uncleared_message <= RAND_STRING_SIZE; TODO Might not be right
+                    self.uncleared_message.extend_from_slice(&buf[..n_bytes_read]);
+                    None
+                };
+                update_byte_history(&mut self.byte_history, &self.uncleared_message);
+                let complete = Shell::process_is_complete(end_indication_bytes, &self.byte_history);
+                // Probably have to hold the state of the last 16 bytes in case it spans across byte
+                // boundaries.
+                job = match job {
+                    JobOut::Memory(mut v) => {
+                        if let Some(cleared) = cleared_message {
+                            if v.len() + cleared.len() > MAX_MEMORY_SIZE {
+                                let mut f = tempfile::tempfile().expect("Failed to create tempfile");
+                                f.write_all(&v).expect("Failed to write to file");
+                                f.write_all(&cleared).expect("Failed to write to file");
+                                JobOut::File(f)
+                            } else {
+                                v.extend_from_slice(&cleared);
+                                JobOut::Memory(v)
+                            }
+                        } else {
+                            JobOut::Memory(v)
+                        }
+                    }
+                    JobOut::File(mut f) => {
+                        if let Some(cleared) = cleared_message {
+                            if complete || cleared.len() + self.cached_message.len() > CACHE_SIZE {
+                                f.write_all(&self.cached_message)
+                                    .expect("Failed to write to file");
+                                f.write_all(&cleared).expect("Failed to write to file");
+                                self.cached_message = Vec::new();
+                            } else {
+                                self.cached_message.extend_from_slice(&cleared);
+                            }
+                        }
+                        JobOut::File(f)
+                    }
+                    JobOut::None => {
+                        if cleared_message.is_some() {
+                            JobOut::Memory(cleared_message.unwrap())
+                        } else {
+                            JobOut::None
+                        }
+                    }
+                };
+                if complete {
+                    return job
+                }
+                if buf_size == n_bytes_read {
+                    buf_size = (buf_size * 14 / 10).min(2048);
+                }
             } else {
-                JobOut::None
+                return job
             }
         }
-        _ => {
-            panic!("Stderr is being written to a file, this shouldn't be possible")
-        }
-    };
-    return job;
+    }
+
+    //fn read_stderr(&mut self) -> JobOut {
+    //    if complete {
+    //        // theoretically stderr should only pop up when a command
+    //        // fails
+    //        let mut err_end: bool;
+    //        let mut buf = vec![0; buf_size]; // I have found no performance
+    //        loop {
+    //            // TODO: Have 2 different signals from the shell. One
+    //            // if there was an error, and one if there wasn't
+    //            if let Ok(n_bytes_read) = self.stderr.read(&mut buf) {
+    //                if n_bytes_read > 0 {
+    //                    stderr = handle_stderr_reads(stderr, &buf, n_bytes_read);
+    //                    (stderr, err_end) = match stderr {
+    //                        JobOut::Memory(mut v) => {
+    //                            if Shell::process_is_complete(
+    //                                self.end_string.as_bytes(),
+    //                                &v[v.len() - self.end_string.len()..],
+    //                            ) {
+    //                                if v.len() == self.end_string.len() {
+    //                                    (JobOut::None, true)
+    //                                } else {
+    //                                    v.truncate(v.len() - self.end_string.len());
+    //                                    (JobOut::Memory(v), true)
+    //                                }
+    //                            } else {
+    //                                (JobOut::Memory(v), false)
+    //                            }
+    //                        }
+    //                        JobOut::None => (JobOut::None, false),
+    //                        _ => {
+    //                            panic!("Stderr should never be a file")
+    //                        }
+    //                    };
+    //                    if err_end {
+    //                        return (stdout, stderr);
+    //                    }
+    //                }
+    //            }
+    //        }
+    //    }
+    //}
 }
 
 fn update_byte_history(byte_history: &mut EndBytes, buf: &[u8]) {
