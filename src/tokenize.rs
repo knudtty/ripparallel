@@ -1,4 +1,4 @@
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum Token {
     Literal(String),
     Substitute,
@@ -109,6 +109,7 @@ impl Lexer {
     }
 
     fn read_brackets(&mut self) -> Token {
+        let position = self.position;
         loop {
             match self.ch {
                 b'}' => {
@@ -120,6 +121,7 @@ impl Lexer {
                 _ => self.read_char()
             }
         }
-        return Token::Substitute;
+        // if closing } is never encountered
+        return Token::Literal(self.input[position..self.position].to_owned());
     }
 }

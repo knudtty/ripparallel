@@ -54,76 +54,73 @@ struct Args {
     job: Vec<String>,
 }
 
-struct MyStringIterator<'a> {
-    inner: Box<dyn Iterator<Item = String> + 'a>,
+struct CommandIterator<'a> {
+    vec: &'a Vec<String>,
+    ch: Option<char>,
+    vec_idx: usize,
+    read_idx: usize,
 }
 
-impl<'a> MyStringIterator<'a> {
-    // Create an iterator from a whitespace-separated string
-    fn from_str(input: &'a str) -> Self {
-        let inner = Box::new(CustomSplit::new(input));
-        MyStringIterator { inner }
-    }
-
+impl<'a> CommandIterator<'a> {
     // Create an iterator from a Vec<String>
-    fn from_vec(vec: Vec<String>) -> Self {
-        let inner = Box::new(vec.into_iter());
-        MyStringIterator { inner }
+    fn from_vec(vec: &'a Vec<String>) -> Self {
+        CommandIterator {
+            vec,
+            ch: None,
+            vec_idx: 0,
+            read_idx: 0,
+        }
+    }
+
+    fn read_char(&mut self) {
+        match self.vec.get(self.vec_idx) {
+            Some(v) => {
+                self.ch = v.chars().nth(self.read_idx);
+                if self.ch.is_some() {
+                    self.read_idx += 1;
+                } else {
+                    self.read_idx = 0;
+                }
+            }
+            None => {}
+        }
     }
 }
 
-impl<'a> Iterator for MyStringIterator<'a> {
-    type Item = String;
+impl<'a> Iterator for CommandIterator<'a> {
+    type Item = char;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let out = self.inner.next();
-        match out {
-            Some(mut v) => {
-                v.push(' ');
-                Some(v)
+        if self.vec.len() == 1 {
+            self.read_char();
+            return self.ch;
+        } else {
+            self.read_char();
+            if self.ch == None {
+                self.vec_idx += 1;
+                if self.vec_idx < self.vec.len() {
+                    return Some(' ');
+                } else {
+                    return None;
+                }
+            } else {
+                return self.ch;
             }
-            None => {
-                out
-            }
         }
-    }
-}
-
-#[derive(Debug)]
-struct CustomSplit<'a> {
-    input: &'a str,
-    end: usize,
-}
-
-impl<'a> CustomSplit<'a> {
-    fn new(input: &'a str) -> Self {
-        CustomSplit {
-            input,
-            end: 0,
-        }
-    }
-}
-
-impl<'a> Iterator for CustomSplit<'a> {
-    type Item = String;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        let mut out = None;
-        if self.end < self.input.len() {
-            out = Some(self.input.get(self.end..self.end+1).unwrap().to_owned());
-            self.end += 1;
-        }
-        return out;
     }
 }
 
 fn pre_parse_command(command_args: &Vec<String>, quotes: bool) -> Vec<Token> {
-    let cmditer = if command_args.len() == 1 {
-        MyStringIterator::from_str(&command_args[0])
-    } else {
-        MyStringIterator::from_vec(command_args.clone())
-    };
-    let tokens = Token::get_tokens(cmditer.collect(), quotes);
+    let cmditer = CommandIterator::from_vec(command_args);
+    let command: String = cmditer.collect();
+    let mut tokens = Token::get_tokens(command, quotes);
+    if !tokens.iter().any(|token| *token == Token::Substitute) {
+        match tokens.last_mut() {
+            Some(Token::Literal(literal)) => literal.push(' '),
+            _ => {}
+        }
+        tokens.push(Token::Substitute);
+    }
     tokens
 }
 
@@ -135,7 +132,7 @@ fn parse_command(tokens: &Vec<Token>, job: String) -> String {
             Token::Substitute => {
                 substituted = true;
                 &job
-            },
+            }
         });
         out
     });
@@ -143,7 +140,7 @@ fn parse_command(tokens: &Vec<Token>, job: String) -> String {
         parsed.push(' ');
         parsed.push_str(job.as_str());
     }
-    parsed 
+    parsed
 }
 
 fn update_byte_history(byte_history: &mut EndBytes, buf: &[u8]) {
