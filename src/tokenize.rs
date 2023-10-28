@@ -2,6 +2,7 @@
 pub enum Token {
     Literal(String),
     Substitute,
+    JobNumber,
 }
 
 impl Token {
@@ -38,6 +39,7 @@ impl Token {
                             out.push(Token::Substitute)
                         }
                     }
+                    _ => out.push(token),
                 }
                 token_idx += 1;
             }
@@ -81,9 +83,34 @@ impl Lexer {
         self.read_position += 1;
     }
 
+    fn peek(&self, n: usize) -> Option<u8> {
+        if self.read_position + n < self.input.as_bytes().len() {
+            Some(self.input.as_bytes()[self.read_position + n])
+        } else {
+            None
+        }
+    }
+
     fn next_token(&mut self) -> Option<Token> {
         return match self.ch {
-            b'{' => Some(self.read_brackets()),
+            b'{' => match self.peek(0) {
+                Some(b'n') => {
+                    if self.peek(1) == Some(b'}') {
+                        Some(self.read_job_number())
+                    } else {
+                        Some(Token::Literal(self.read_literal()))
+                    }
+                }
+                Some(b'N') => {
+                    if self.peek(1) == Some(b'}') {
+                        Some(self.read_job_number())
+                    } else {
+                        Some(Token::Literal(self.read_literal()))
+                    }
+                }
+                Some(b'}') => Some(self.read_brackets()),
+                _ => Some(Token::Literal(self.read_literal())),
+            },
             0 => None,
             _ => Some(Token::Literal(self.read_literal())),
         };
@@ -94,7 +121,9 @@ impl Lexer {
         loop {
             match self.ch {
                 b'{' => {
-                    if Some(b'\\') == self.input.bytes().nth(self.read_position - 1) {
+                    if Some(b'\\') == self.input.bytes().nth(self.read_position - 1)
+                        || position == self.position
+                    {
                         self.read_char();
                     } else {
                         break;
@@ -114,14 +143,20 @@ impl Lexer {
             match self.ch {
                 b'}' => {
                     self.read_char();
-                    return Token::Substitute
-                },
+                    return Token::Substitute;
+                }
                 0 => break,
-                // TODO: expand to arguments inside {}
-                _ => self.read_char()
+                _ => self.read_char(),
             }
         }
         // if closing } is never encountered
         return Token::Literal(self.input[position..self.position].to_owned());
+    }
+
+    fn read_job_number(&mut self) -> Token {
+        self.read_char(); // {
+        self.read_char(); // n
+        self.read_char(); // }
+        Token::JobNumber
     }
 }

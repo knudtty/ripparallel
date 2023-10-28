@@ -108,7 +108,6 @@ impl<'a> Iterator for CommandIterator<'a> {
 }
 
 fn pre_parse_command(command_args: &Vec<String>, quotes: bool) -> Vec<Token> {
-    println!("command args: {:?}", command_args);
     let cmditer = CommandIterator::from_vec(command_args);
     let command: String = cmditer.collect();
     //println!("command: {:?}", command);
@@ -125,21 +124,24 @@ fn pre_parse_command(command_args: &Vec<String>, quotes: bool) -> Vec<Token> {
     tokens
 }
 
-fn parse_command(tokens: &Vec<Token>, job: String) -> String {
+fn parse_command(tokens: &Vec<Token>, job: &(usize, String)) -> String {
     let mut substituted = false;
     let mut parsed = tokens.iter().fold(String::new(), |mut out, token| {
-        out.push_str(match token {
-            Token::Literal(s) => &s,
+        match token {
+            Token::Literal(s) => out.push_str(&s),
             Token::Substitute => {
                 substituted = true;
-                &job
+                out.push_str(&job.1)
             }
-        });
+            Token::JobNumber => {
+                out.push_str(job.0.to_string().as_str())
+            }
+        };
         out
     });
     if !substituted {
         parsed.push(' ');
-        parsed.push_str(job.as_str());
+        parsed.push_str(job.1.as_str());
     }
     parsed
 }
@@ -216,7 +218,7 @@ fn main() {
                     loop {
                         match job {
                             Message::Job(job) => {
-                                let command = parse_command(&job_tokens, job.1);
+                                let command = parse_command(&job_tokens, &job);
                                 if args.dryrun {
                                     let command = command.clone();
                                     stdout_sender
